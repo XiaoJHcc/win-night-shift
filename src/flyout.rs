@@ -28,8 +28,7 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, GetClientRect, PostMessageW, PostQuitMessage, SetForegroundWindow,
-    SetWindowPos, SystemParametersInfoW, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOZORDER,
+    EnumChildWindows, GetClientRect, PostMessageW, SetForegroundWindow, SetWindowPos, SystemParametersInfoW, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOZORDER,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WA_INACTIVE, WM_ACTIVATE, WM_USER,
 };
 use winui3::bootstrap::PackageDependency;
@@ -40,7 +39,7 @@ use winui3::Microsoft::UI::Xaml::Controls::Primitives::{
 };
 use winui3::Microsoft::UI::Xaml::Controls::{
     AppBarButton, Border, ColumnDefinition, CommandBarLabelPosition, FontIcon, Grid, Orientation,
-    Slider, StackPanel, TextBlock, ToggleSwitch, XamlControlsResources,
+    Slider, StackPanel, TextBlock, XamlControlsResources,
 };
 use winui3::Microsoft::UI::Xaml::Hosting::{DesktopWindowXamlSource, WindowsXamlManager};
 use winui3::Microsoft::UI::Xaml::Input::PointerEventHandler;
@@ -48,14 +47,14 @@ use winui3::Microsoft::UI::Xaml::Media::{Brush, DesktopAcrylicBackdrop};
 use winui3::Microsoft::UI::Xaml::{
     Application, CornerRadius, ElementTheme, FrameworkElement, GridLength, GridUnitType,
     HorizontalAlignment, LaunchActivatedEventArgs, ResourceDictionary, RoutedEventHandler,
-    TextAlignment, Thickness, UIElement, VerticalAlignment,
+    TextAlignment, Thickness, VerticalAlignment,
 };
 use winui3::{XamlApp, XamlAppOverrides};
 
 /// 面板逻辑尺寸（96dpi 基准），高度按下列常量累加得出。
 ///
-/// 布局照快速设置面板：顶部三枚瓦片 → 分隔线 → 拉条 → 分隔线 →
-/// 开机自启行 → 分隔线 → 底栏，全部直接坐在亚克力上，无卡片。
+/// 布局照快速设置面板：顶部三枚瓦片 → 分隔线 → 拉条 → 分隔线 → 底栏，
+/// 全部直接坐在亚克力上，无卡片。开机自启不在面板里，挪到了托盘右键菜单。
 ///
 /// 不做运行时测量：`DesktopWindowXamlSource` 的内容树量不出可用的高度
 /// （手动 `Measure` 早于模板套用、`ActualHeight` 是布局后的值、`DesiredSize` 返回 0），
@@ -69,24 +68,22 @@ const TILE_H: i32 = 48;
 const TILE_LABEL_GAP: i32 = 8;
 /// 瓦片下方文字标签行高（FontSize 12）。
 const LABEL_H: i32 = 20;
-/// 拉条与开机自启行高：控件的 `MinHeight`（32）上下各留 4。
+/// 拉条行高：控件的 `MinHeight`（32）上下各留 4。
 const ROW_H: i32 = 40;
 /// 分隔线高 1px，与相邻区块的间距。
 const SEP_H: i32 = 1;
 const SEP_GAP: i32 = 12;
-/// 面板横向内边距（瓦片区/拉条/开机自启行共用），快速设置取 16 一档。
+/// 面板横向内边距（瓦片区/拉条共用），快速设置取 16 一档。
 const PAD_H: i32 = 16;
 /// 顶部内边距。
 const TOP_PAD: i32 = 16;
 /// 底栏高度：`AppBarThemeCompactHeight`。
 const FOOTER_H: i32 = 48;
 
-/// 面板高度 = 顶边距 + 瓦片区 + 分隔线 + 拉条行 + 分隔线 + 自启行 + 分隔线 + 底栏。
+/// 面板高度 = 顶边距 + 瓦片区 + 分隔线 + 拉条行 + 分隔线 + 底栏。
 /// 底栏前那条分隔线只有上间距（底栏自带留白）。
 const PANEL_H: i32 = TOP_PAD
     + (TILE_H + TILE_LABEL_GAP + LABEL_H)
-    + (SEP_GAP + SEP_H + SEP_GAP)
-    + ROW_H
     + (SEP_GAP + SEP_H + SEP_GAP)
     + ROW_H
     + (SEP_GAP + SEP_H)
@@ -103,7 +100,6 @@ struct Items {
     dark: ToggleButton,
     /// 原彩（True Tone）：仅预留占位，禁用态，无逻辑。
     truetone: ToggleButton,
-    autostart: ToggleSwitch,
 }
 
 /// 色温值文本：如「6500K」。
@@ -126,7 +122,6 @@ impl Items {
             let _ = self.strength.SetValue2(f64::from(strength));
             let _ = self.kelvin.SetText(&HSTRING::from(kelvin_text(strength)));
             let _ = set_checked(&self.dark, crate::theme::is_dark());
-            let _ = self.autostart.SetIsOn(crate::autostart::is_autostart());
         });
     }
 }
@@ -636,36 +631,7 @@ fn make_label(text: &str) -> Result<TextBlock> {
     Ok(tb)
 }
 
-/// 「左标签 + 右控件」的设置行：Star/Auto 两列，行高 `min_h`。
-fn make_setting_row(label: &str, min_h: f64) -> Result<Grid> {
-    let row = Grid::new()?;
-    row.SetHorizontalAlignment(HorizontalAlignment::Stretch)?;
-    row.SetMinHeight(min_h)?;
-    for t in [GridUnitType::Star, GridUnitType::Auto] {
-        let col = ColumnDefinition::new()?;
-        col.SetWidth(GridLength {
-            Value: 1.0,
-            GridUnitType: t,
-        })?;
-        row.ColumnDefinitions()?.Append(&col)?;
-    }
-    let tb = make_label(label)?;
-    Grid::SetColumn(&tb, 0)?;
-    row.Children()?.Append(&tb)?;
-    Ok(row)
-}
-
-/// 把控件放进设置行右列（垂直居中、靠右，防止列比控件宽时贴左）。
-fn set_row_control(row: &Grid, ctl: &UIElement) -> Result<()> {
-    let fe = ctl.cast::<FrameworkElement>()?;
-    fe.SetVerticalAlignment(VerticalAlignment::Center)?;
-    fe.SetHorizontalAlignment(HorizontalAlignment::Right)?;
-    Grid::SetColumn(&fe, 1)?;
-    row.Children()?.Append(&fe)?;
-    Ok(())
-}
-
-/// 底栏：右对齐的退出图标按钮。
+/// 底栏：右对齐的设置图标按钮（预留占位，暂无设置页，不绑动作）。
 ///
 /// 不设背景、不设边框——背景即浮窗基底（亚克力本身），与上方区块的分隔
 /// 由独立的分隔线元素承担（见 populate_root）。
@@ -678,14 +644,9 @@ fn make_footer() -> Result<Border> {
     bar.SetHorizontalAlignment(HorizontalAlignment::Right)?;
     bar.SetVerticalAlignment(VerticalAlignment::Center)?;
 
-    // U+E711 Cancel，取自 Segoe Fluent Icons，与系统底栏同款字形。
-    let quit = make_command_button("\u{E711}", "退出")?;
-    quit.Click(&RoutedEventHandler::new(|_, _| {
-        // 回调跑在消息循环所在线程，直接投 WM_QUIT 即可。
-        unsafe { PostQuitMessage(0) };
-        Ok(())
-    }))?;
-    bar.Children()?.Append(&quit)?;
+    // U+E713 Setting（齿轮），取自 Segoe Fluent Icons，与系统各处设置入口同款字形。
+    let settings = make_command_button("\u{E713}", "设置")?;
+    bar.Children()?.Append(&settings)?;
 
     let footer = Border::new()?;
     footer.SetMinHeight(f64::from(FOOTER_H))?;
@@ -731,8 +692,8 @@ fn make_command_button(glyph: &str, label: &str) -> Result<AppBarButton> {
     Ok(b)
 }
 
-/// 把各区块装进食根面板：瓦片区 → 分隔线 → 强度拉条 → 分隔线 →
-/// 开机自启行 → 分隔线 → 底栏。全部直接坐在亚克力基底上，不用卡片。
+/// 把各区块装进根面板：瓦片区 → 分隔线 → 强度拉条 → 分隔线 → 底栏。
+/// 全部直接坐在亚克力基底上，不用卡片。开机自启不在此处，见托盘右键菜单（tray.rs）。
 /// `separators` 收集显式设主题画刷的分隔线，供 apply_theme_brushes 重刷。
 fn populate_root(root: &StackPanel, items: &Items, separators: &mut Vec<Border>) -> Result<()> {
     let tiles = make_tiles(items)?;
@@ -789,36 +750,13 @@ fn populate_root(root: &StackPanel, items: &Items, separators: &mut Vec<Border>)
 
     root.Children()?.Append(&row)?;
 
-    let sep2 = make_separator(f64::from(SEP_GAP), f64::from(SEP_GAP))?;
+    // 底栏前的分隔线只留上间距：底栏自身高度已含留白。
+    let sep2 = make_separator(f64::from(SEP_GAP), 0.0)?;
     root.Children()?.Append(&sep2)?;
     separators.push(sep2);
 
-    // 开机自启行：左标签 + 右开关，直接放背景上。
-    let row = make_setting_row("开机自启", f64::from(ROW_H))?;
-    row.SetMargin(Thickness {
-        Left: pad,
-        Top: 0.0,
-        Right: pad,
-        Bottom: 0.0,
-    })?;
-    set_row_control(&row, &items.autostart.cast()?)?;
-    root.Children()?.Append(&row)?;
-
-    // 底栏前的分隔线只留上间距：底栏自身高度已含留白。
-    let sep3 = make_separator(f64::from(SEP_GAP), 0.0)?;
-    root.Children()?.Append(&sep3)?;
-    separators.push(sep3);
-
     root.Children()?.Append(&make_footer()?)?;
     Ok(())
-}
-
-fn make_toggle() -> Result<ToggleSwitch> {
-    let sw = ToggleSwitch::new()?;
-    // 默认样式带 MinWidth≈156（为 On/Off 文本预留），会让所在 Auto 列吃掉标签的宽度。
-    // 清掉，让列宽等于开关实际宽度。
-    sw.SetMinWidth(0.0)?;
-    Ok(sw)
 }
 
 fn build() -> Result<Flyout> {
@@ -889,7 +827,6 @@ fn build() -> Result<Flyout> {
         kelvin: TextBlock::new()?,
         dark: make_tile_button("\u{E790}")?,
         truetone,
-        autostart: make_toggle()?,
     };
     bind_controls(&items)?;
 
@@ -972,11 +909,6 @@ fn bind_controls(items: &Items) -> Result<()> {
             refresh();
         }
     })?;
-    bind_switch(&items.autostart, |v| {
-        if !crate::autostart::set_autostart(v) {
-            refresh();
-        }
-    })?;
 
     let kelvin = items.kelvin.clone();
     items.strength.ValueChanged(&RangeBaseValueChangedEventHandler::new(
@@ -1021,17 +953,6 @@ fn bind_tile<F: Fn(bool) + Send + 'static>(btn: &ToggleButton, f: F) -> Result<(
     btn.Click(&RoutedEventHandler::new(move |_, _| {
         if !is_syncing() {
             f(b.IsChecked().ok().and_then(|r| r.Value().ok()).unwrap_or(false));
-        }
-        Ok(())
-    }))?;
-    Ok(())
-}
-
-fn bind_switch<F: Fn(bool) + Send + 'static>(sw: &ToggleSwitch, f: F) -> Result<()> {
-    let sw2 = sw.clone();
-    sw.Toggled(&RoutedEventHandler::new(move |_, _| {
-        if !is_syncing() {
-            f(sw2.IsOn().unwrap_or(false));
         }
         Ok(())
     }))?;

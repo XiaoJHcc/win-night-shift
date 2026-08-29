@@ -35,8 +35,6 @@ const WATCHES: &[(&str, bool)] = &[
         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize",
         false,
     ),
-    // 开机自启项。
-    (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", false),
 ];
 
 /// 启动监听线程。`notify` 为接收 `WM_SETTINGS_CHANGED` 的隐藏窗口。

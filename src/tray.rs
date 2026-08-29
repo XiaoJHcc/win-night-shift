@@ -4,13 +4,24 @@
 //! 系统库存图标（IDI_INFORMATION）栅格化为 RGBA —— 用的是系统图标，
 //! 不做任何自绘。
 //!
-//! 不挂原生菜单：挂了菜单，右键会被 tray-icon 的 TrackPopupMenu 抢先接管，
-//! 收不到 TrayIconEvent；不挂则左右键都只发事件，由主循环转给浮窗。
+//! 左右键分工：
+//!  * 左键不挂菜单（`with_menu_on_left_click(false)`）：只发 TrayIconEvent，
+//!    由主循环拨动浮窗；
+//!  * 右键挂 muda 菜单，由 tray-icon 内置的 TrackPopupMenu 弹出——
+//!    Win11 下即系统样式的圆角右键菜单（开机自启勾选 / 设置 / 退出）。
+//!    菜单项点击经 `MenuEvent` 通道投出，由 `handle_menu_events` 处理。
 
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use windows::Win32::UI::WindowsAndMessaging::PostQuitMessage;
 
 pub struct Tray {
     _tray: TrayIcon,
+    /// 「开机自启」勾选项。muda 在投事件前已自动翻转勾选态（见
+    /// muda::platform_impl::windows 的 menu_selected），处理时现读即为目标值。
+    autostart_item: CheckMenuItem,
+    /// 「退出」项的 id，用于事件匹配。
+    quit_id: MenuId,
 }
 
 fn make_icon() -> Option<Icon> {
@@ -25,15 +36,49 @@ fn make_icon() -> Option<Icon> {
 
 impl Tray {
     pub fn new() -> Option<Tray> {
+        // 右键菜单：开机自启（勾选）/ 设置（预留，禁用态）/ 退出。
+        // 勾选初值现读注册表；此后勾选态只经本菜单改动，二者不会失步。
+        let menu = Menu::new();
+        let autostart_item =
+            CheckMenuItem::new("开机自启", true, crate::autostart::is_autostart(), None);
+        let settings_item = MenuItem::new("设置", false, None);
+        let quit_item = MenuItem::new("退出", true, None);
+        let quit_id = quit_item.id().clone();
+        menu.append(&autostart_item).ok()?;
+        menu.append(&settings_item).ok()?;
+        menu.append(&PredefinedMenuItem::separator()).ok()?;
+        menu.append(&quit_item).ok()?;
+
         let mut builder = TrayIconBuilder::new()
             .with_tooltip("win-night-shift")
+            .with_menu(Box::new(menu))
             .with_menu_on_left_click(false);
         if let Some(icon) = make_icon() {
             builder = builder.with_icon(icon);
         }
         Some(Tray {
             _tray: builder.build().ok()?,
+            autostart_item,
+            quit_id,
         })
+    }
+
+    /// 处理右键菜单项点击（主循环每轮泵一次）。
+    pub fn handle_menu_events(&self) {
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if event.id == self.quit_id {
+                // 本函数跑在消息循环所在线程，直接投 WM_QUIT 即可。
+                unsafe { PostQuitMessage(0) };
+            } else if event.id == *self.autostart_item.id() {
+                // muda 投事件前已翻转勾选态，is_checked 即用户意图；
+                // 写注册表失败时把控件扳回。
+                let v = self.autostart_item.is_checked();
+                if !crate::autostart::set_autostart(v) {
+                    self.autostart_item.set_checked(!v);
+                }
+            }
+            // 「设置」为预留项，禁用态，不会产生事件。
+        }
     }
 }
 

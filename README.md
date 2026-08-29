@@ -9,13 +9,14 @@ WindowsAppRuntime 框架包提供，单 exe、不引入 .NET；运行时缺失�
 
 - **夜间模式**：开关 + 0–100 强度拉条（拖动即生效），对应系统设置里的「夜间模式」。
 - **颜色主题**：深色模式开关，应用与系统界面（任务栏等）同时切换并即时刷新。
-- **开机自启**：开关，写 HKCU\...\Run。
+- **开机自启**：托盘右键菜单勾选项，写 HKCU\...\Run。
 - 面板打开期间监听注册表变化：系统设置等外部途径改了上述项，面板控件实时跟随。
-- 托盘左右键都弹出浮窗；浮窗失焦自动收起，底栏按钮退出程序。
+- 托盘左键弹出/收起浮窗；浮窗失焦自动收起。右键弹出系统样式菜单：
+  开机自启（勾选）、设置（预留）、退出。
 
 ## 运行
 
-直接双击 `win-night-shift.exe`，托盘出现图标即在运行。左键或右键点托盘图标弹出浮窗。
+直接双击 `win-night-shift.exe`，托盘出现图标即在运行。左键点托盘图标弹出浮窗，右键点弹出菜单。
 
 依赖系统已装的 WindowsAppRuntime（WinUI 3 运行时，Win11 自带；Win10 1809+ 可另行安装）。
 
@@ -37,11 +38,11 @@ winui3 crate 从 git 拉取（crates.io 版本缺 UI_Xaml_Hosting 等 feature）
 |---|---|
 | `src/main.rs` | 入口、DPI 感知、隐藏消息窗口、消息循环、托盘事件分发 |
 | `src/flyout.rs` | WinUI 3 托盘浮窗（XAML 岛、托盘锚定定位、卡片样式、失焦收起） |
-| `src/tray.rs` | 托盘图标（不挂菜单，左右键事件交主循环）；图标缺失时回退系统库存图标 |
+| `src/tray.rs` | 托盘图标与右键菜单（muda，开机自启勾选/设置/退出）；图标缺失时回退系统库存图标 |
 | `src/nightlight.rs` | 夜间模式 CloudStore 注册表 blob 读写（开关 + 强度） |
 | `src/theme.rs` | Personalize 键亮暗切换 + `ImmersiveColorSet` 广播 |
 | `src/autostart.rs` | HKCU\...\Run 开机自启 |
-| `src/watch.rs` | 注册表变更监听线程（CloudStore/Personalize/Run），命中后投消息给隐藏窗口 |
+| `src/watch.rs` | 注册表变更监听线程（CloudStore/Personalize），命中后投消息给隐藏窗口 |
 | `src/reg.rs` | HKCU 注册表读写最小封装 |
 | `build.rs` | 嵌入 `img/icon.ico`（存在时） |
 
@@ -55,7 +56,7 @@ winui3 crate 从 git 拉取（crates.io 版本缺 UI_Xaml_Hosting 等 feature）
 - **读取取「注册表最后写入时间最新」的那把设置键**：系统设置拖强度拉条只写主设置键且延迟落盘（拖动时不写，关闭设置页后才刷入），多把键的值可能互相矛盾，不能按固定优先级读。
 - 系统设置 App 对拉条的修改是**延迟落盘**的：面板会在系统实际写入注册表时（通常是关闭设置页后）实时跟随，而不是拖动的当下——这是系统行为，不是面板漏更新。
 
-面板打开期间，watch 线程用 `RegNotifyChangeKeyValue` 监听 CloudStore（夜间模式）、Personalize（亮暗）、Run（自启）三处注册表键，外部改动落盘时实时同步到面板控件；拖动拉条期间不回写，避免把滑条从用户手下拽走。面板每次打开也会现读一次系统状态。
+面板打开期间，watch 线程用 `RegNotifyChangeKeyValue` 监听 CloudStore（夜间模式）、Personalize（亮暗）两处注册表键，外部改动落盘时实时同步到面板控件；拖动拉条期间不回写，避免把滑条从用户手下拽走。面板每次打开也会现读一次系统状态。
 
 强度拉条拖动时注册表写入做了 300ms 节流（密集写入会被系统判定冲突），松手时补写最终值。
 

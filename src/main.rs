@@ -47,7 +47,7 @@ fn main() {
     }
 
     // 托盘必须在消息循环所在线程创建。
-    let Some(_tray) = tray::Tray::new() else {
+    let Some(tray) = tray::Tray::new() else {
         return;
     };
 
@@ -76,18 +76,22 @@ fn main() {
             DispatchMessageW(&msg);
         }
 
-        // 托盘不挂原生菜单，左右键都只发事件：一律拨动浮窗。
+        // 左键不挂菜单只发事件：拨动浮窗。右键菜单由 tray-icon 内置的
+        // TrackPopupMenu 弹出（事件照样会发，故必须只认左键），
+        // 菜单项点击走 MenuEvent 通道另行处理。
         // 只认 Up：一次点击的 Down/Up 都响应会触发两次。
         while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
             if let tray_icon::TrayIconEvent::Click {
-                rect,
+                button: tray_icon::MouseButton::Left,
                 button_state: tray_icon::MouseButtonState::Up,
+                rect,
                 ..
             } = event
             {
                 flyout::toggle_at(rect);
             }
         }
+        tray.handle_menu_events();
     }
 }
 
