@@ -225,6 +225,33 @@ pub fn refresh() {
     });
 }
 
+/// 外部改动（watch 线程投来的注册表变更通知）：面板可见时现读系统状态回写控件。
+///
+/// 两个保护：
+///  * 面板隐藏时直接返回——下次打开时 show_at 会 sync，无需现在做；
+///  * 滑条正被按住（PointerCaptures 非空）时不同步——此时注册表里可能还是
+///    节流前的旧值，回写会把滑条从用户手下拽走。松手后补写最终值引发的
+///    回声通知读到的就是当前值，sync 自然是无操作。
+pub fn on_external_change() {
+    FLYOUT.with(|c| {
+        let borrow = c.borrow();
+        let Some(f) = borrow.as_ref() else { return };
+        if !f.visible || slider_captured(&f.items.strength) {
+            return;
+        }
+        f.items.sync();
+    });
+}
+
+/// 滑条是否正被指针按住（拖动中）。
+fn slider_captured(slider: &Slider) -> bool {
+    slider
+        .PointerCaptures()
+        .and_then(|v| v.Size())
+        .map(|n| n > 0)
+        .unwrap_or(false)
+}
+
 /// 展开/收起动画帧驱动（hidden 窗口 WM_TIMER 周期调用，见 main.rs）。
 ///
 /// 当前三张卡片高度固定、无展开态，timer 不会被启动；保留此入口与 lock-ime

@@ -8,13 +8,29 @@
 //!   的 +1（最后修改时间戳），并在索引 23 处插入/删除 `0x10 0x00` 两字节。
 //! - 强度：CloudStore 下同一设置同时存在多把键——主设置
 //!   `default$...bluelightreduction.settings`、每个显示设备的
-//!   `{guid}$...settingsperdevice`（**实际生效的是它**）、旧版命名
-//!   `default$...bluelightreduction.bluelightreduction.settings`。
+//!   `{guid}$...settingsperdevice`（由系统自己维护，见下文写入策略）、
+//!   旧版命名 `default$...bluelightreduction.bluelightreduction.settings`。
 //!   blob 中 `CF 28` 标记后的两个字节是色温（1200–6500K）：
 //!   `lo = ((K & 0x3F) << 1) | 0x80`，`hi = K >> 6`。
-//!   所有设置键一起原地改这两字节并推进内嵌时间戳，不动排程等字段。
+//!   原地改这两字节并推进内嵌时间戳，不动排程等字段。
 //!
 //! 所有操作对 blob 做长度/标记校验，格式不符时静默失败（返回 false/None）。
+//!
+//! # 写入策略（实测结论）
+//! **只写主设置键**，与系统设置 App 的写入面一致：只写主键即可让屏幕色温
+//! 即时生效、长期保持。per-device 键不写：
+//!  * 它是系统维护的派生副本——系统落盘时会把主键值同步过去（两键
+//!    注册表写入时间完全相同），外部写入对它的显示效果为零；
+//!  * 内嵌时间戳全 0xFF 的 blob（系统重置后的状态）写入后被系统无视；
+//!    有效时间戳的单次写入虽不生效但也不被惩罚（观察 4 分钟无重置），
+//!    但早期版本在拖动中高频同时写主键+per-device 时曾被系统判定冲突、
+//!    把夜间模式打回关闭——既然写了也没用，就不写，远离出事条件。
+//!
+//! # 读取策略（实测结论）
+//! 同一时刻多把键的值可能互相矛盾：系统设置 App 拖强度拉条**只写主设置键**，
+//! 而且是延迟落盘（拖动时不写，离开页面/过一阵才刷入）；per-device 键被
+//! 系统冲突重置后残留旧值。因此读取不看固定优先级，而是跳过重置标记的
+//! blob、取**注册表最后写入时间最新**的那把键的值。
 
 use crate::reg;
 
@@ -100,20 +116,34 @@ fn toggle_state_blob(data: &mut Vec<u8>, enable: bool) -> Option<bool> {
     Some(true)
 }
 
-/// 读取当前强度 0–100；优先 per-device（当前显示设备实际生效的那把），
-/// 其次主设置键，最后旧版键。都找不到返回 None。
+/// 读取当前强度 0–100。
+///
+/// 多把键可能并存且值互相矛盾（系统设置只写主设置键；per-device 键被系统
+/// 冲突重置后残留旧值），在跳过重置 blob 后取**注册表最后写入时间最新**
+/// 的那把键的值。都找不到返回 None。
 pub fn get_strength() -> Option<u32> {
-    let mut keys = settings_keys();
-    // perdevice 优先：多显示器/换显示器时它是实际生效值。
-    keys.sort_by_key(|k| !k.contains("settingsperdevice"));
-    for k in keys {
-        if let Some(data) = reg::read_binary(&k, "Data") {
-            if let Some(s) = parse_strength(&data) {
-                return Some(s);
-            }
+    let mut best: Option<(u64, u32)> = None;
+    for k in all_settings_keys() {
+        let Some(data) = reg::read_binary(&k, "Data") else {
+            continue;
+        };
+        if is_reset_blob(&data) {
+            continue;
+        }
+        let Some(s) = parse_strength(&data) else {
+            continue;
+        };
+        let t = reg::key_last_write(&k).unwrap_or(0);
+        if best.map_or(true, |(bt, _)| t > bt) {
+            best = Some((t, s));
         }
     }
-    None
+    Some(best?.1)
+}
+
+/// blob 内嵌时间戳（字节 10..14）全 0xFF：系统冲突重置的标记，值不可信。
+fn is_reset_blob(data: &[u8]) -> bool {
+    data.len() > 15 && data[10..15].iter().all(|&b| b == 0xFF)
 }
 
 fn parse_strength(data: &[u8]) -> Option<u32> {
@@ -133,11 +163,24 @@ fn find_temp_marker(data: &[u8]) -> Option<usize> {
 /// 同一设置会同时存在多把：主设置 `default$...bluelightreduction.settings`、
 /// 每个显示设备的 `{guid}$...settingsperdevice`、旧版命名
 /// `default$...bluelightreduction.bluelightreduction.settings`。
-/// 实际生效的是 per-device。只写新式键（主设置 + per-device），与系统
-/// 设置 App 的写入面保持一致，避免旧版键参与 CloudStore 合并造成冲突；
-/// 只有在新式键全不存在（老系统）时才退到旧版键。
 /// 叶键名不能从父键名推导（旧版父键的叶名与父名不同），统一枚举子键。
+///
+/// 写入只用新式键（主设置 + per-device），与系统设置 App 的写入面保持一致，
+/// 避免旧版键参与 CloudStore 合并造成冲突；只有在新式键全不存在（老系统）
+/// 时才退到旧版键。读取则用 `all_settings_keys` 全量比较新旧（见 get_strength）。
 fn settings_keys() -> Vec<String> {
+    let (modern, legacy) = collect_settings_keys();
+    if modern.is_empty() { legacy } else { modern }
+}
+
+/// 全部设置类键（新式 + 旧版），读取用。
+fn all_settings_keys() -> Vec<String> {
+    let (mut modern, legacy) = collect_settings_keys();
+    modern.extend(legacy);
+    modern
+}
+
+fn collect_settings_keys() -> (Vec<String>, Vec<String>) {
     let mut modern = Vec::new();
     let mut legacy = Vec::new();
     for name in reg::enum_subkeys(CLOUDSTORE_CURRENT) {
@@ -154,7 +197,7 @@ fn settings_keys() -> Vec<String> {
             }
         }
     }
-    if modern.is_empty() { legacy } else { modern }
+    (modern, legacy)
 }
 
 /// 纯函数，便于单测：`Current` 子键名 → 是否设置类键。
@@ -173,23 +216,74 @@ fn classify_settings_parent(name: &str) -> Option<bool> {
     None
 }
 
-/// 设置强度 0–100：写入所有设置类 blob（主设置 + 各设备 perdevice + 旧版键），
+/// 设置强度 0–100：**只写主设置键**（与系统设置 App 的写入面一致），
 /// 并推进 blob 内嵌时间戳，让系统的 CloudStore 监听接受这次修改。
+///
+/// per-device 键不写：它是系统维护的派生副本，外部写入对显示效果为零
+/// （FF 时间戳的写入被系统无视；有效时间戳的单次写入也不生效）；
+/// 早期版本高频同时写主键+per-device 曾被系统判定冲突打回夜间模式，
+/// 既然写了没用，就远离出事条件。详见模块头注释。
+/// 只写主键已实测能让屏幕色温即时生效且长期不被系统改动。
 /// 一把都找不到（用户从未碰过夜间模式设置）时按模板重建主设置键。
 pub fn set_strength(strength: u32) -> bool {
     let kelvin = strength_to_kelvin(strength);
-    let keys = settings_keys();
+    let keys: Vec<String> = settings_keys()
+        .into_iter()
+        .filter(|k| !k.contains("settingsperdevice"))
+        .collect();
     if keys.is_empty() {
         return reg::write_binary(SETTINGS_KEY, "Data", &build_settings_template(kelvin));
     }
     let mut any = false;
     for k in keys {
+        any = write_kelvin_to(&k, kelvin) || any;
+    }
+    any
+}
+
+/// 只写 per-device 键（诊断/对照实验用，examples/dump --set-perdevice）。
+/// 注意：这条路径在生产代码里被有意避开，见 set_strength 的注释。
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_strength_perdevice_only(strength: u32) -> bool {
+    let kelvin = strength_to_kelvin(strength);
+    let mut any = false;
+    for k in settings_keys()
+        .into_iter()
+        .filter(|k| k.contains("settingsperdevice"))
+    {
+        any = write_kelvin_to(&k, kelvin) || any;
+    }
+    any
+}
+
+/// 诊断（examples/dump --set-perdevice-fixts）：先把 per-device blob 的
+/// 全 0xFF 内嵌时间戳修复为当前时间（5 字节变长编码，同模板）再写色温。
+/// 用于复现「带有效时间戳的外部 per-device 写入」这一条件。
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_strength_perdevice_fixts(strength: u32) -> bool {
+    let kelvin = strength_to_kelvin(strength);
+    let mut any = false;
+    for k in settings_keys()
+        .into_iter()
+        .filter(|k| k.contains("settingsperdevice"))
+    {
         let Some(mut data) = reg::read_binary(&k, "Data") else {
             continue;
         };
         let Some(idx) = find_temp_marker(&data) else {
             continue;
         };
+        if is_reset_blob(&data) {
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            data[10] = (t & 0x7F) as u8 | 0x80;
+            data[11] = ((t >> 7) & 0x7F) as u8 | 0x80;
+            data[12] = ((t >> 14) & 0x7F) as u8 | 0x80;
+            data[13] = ((t >> 21) & 0x7F) as u8 | 0x80;
+            data[14] = (t >> 28) as u8;
+        }
         let (lo, hi) = encode_kelvin(kelvin);
         data[idx] = lo;
         data[idx + 1] = hi;
@@ -197,6 +291,21 @@ pub fn set_strength(strength: u32) -> bool {
         any = reg::write_binary(&k, "Data", &data) || any;
     }
     any
+}
+
+/// 原地改一把设置键的色温两字节并推进内嵌时间戳。
+fn write_kelvin_to(key: &str, kelvin: u32) -> bool {
+    let Some(mut data) = reg::read_binary(key, "Data") else {
+        return false;
+    };
+    let Some(idx) = find_temp_marker(&data) else {
+        return false;
+    };
+    let (lo, hi) = encode_kelvin(kelvin);
+    data[idx] = lo;
+    data[idx + 1] = hi;
+    bump_timestamp(&mut data);
+    reg::write_binary(key, "Data", &data)
 }
 
 /// blob 内嵌最后修改时间戳（字节 10..14 变长编码）：第一个非 0xFF 字节 +1。

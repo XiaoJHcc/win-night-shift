@@ -6,7 +6,7 @@ use windows::core::{PWSTR, PCWSTR};
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW,
-    RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE,
+    RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_ENUMERATE_SUB_KEYS, KEY_NOTIFY, KEY_QUERY_VALUE,
     KEY_SET_VALUE, REG_BINARY, REG_DWORD, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
 };
 
@@ -167,9 +167,38 @@ pub fn delete_value(subkey: &str, value: &str) -> bool {
     true
 }
 
+/// 打开子键用于变更监听（`RegNotifyChangeKeyValue`，见 watch.rs）。
+/// 句柄由调用方持有，监听期间不关闭。
+pub fn open_notify(subkey: &str) -> Option<HKEY> {
+    open(subkey, KEY_NOTIFY)
+}
+
+/// 键的注册表最后写入时间（FILETIME 原值，只用于比较新旧）。
+pub fn key_last_write(subkey: &str) -> Option<u64> {
+    let hkey = open(subkey, KEY_QUERY_VALUE)?;
+    let mut ft = windows::Win32::Foundation::FILETIME::default();
+    let rc = unsafe {
+        windows::Win32::System::Registry::RegQueryInfoKeyW(
+            hkey,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut ft),
+        )
+    };
+    unsafe { let _ = RegCloseKey(hkey); }
+    (rc == ERROR_SUCCESS).then_some(((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64)
+}
+
 /// 枚举子键名（CloudStore 按设备/账户分键，需枚举）。
-pub fn enum_subkeys(subkey: &str) -> Vec<String> {
-    let mut out = Vec::new();
+pub fn enum_subkeys(subkey: &str) -> Vec<String> {    let mut out = Vec::new();
     let Some(hkey) = open(subkey, KEY_ENUMERATE_SUB_KEYS) else {
         return out;
     };

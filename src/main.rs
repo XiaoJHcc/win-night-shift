@@ -10,6 +10,7 @@ mod nightlight;
 mod reg;
 mod theme;
 mod tray;
+mod watch;
 
 use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -33,10 +34,11 @@ fn main() {
         );
     }
 
-    // 隐藏消息窗口：浮窗动画的 WM_TIMER 宿主（见 flyout::on_anim_tick）。
-    if create_hidden_window().is_none() {
+    // 隐藏消息窗口：浮窗动画的 WM_TIMER 宿主（见 flyout::on_anim_tick），
+    // 兼作注册表变更通知的接收窗口（见 watch.rs）。
+    let Some(hidden) = create_hidden_window() else {
         return;
-    }
+    };
 
     // 浮窗需在托盘之前初始化：预建面板把首帧开销挪到启动阶段。
     // WindowsAppRuntime 缺失等初始化失败时不做回退，直接退出。
@@ -48,6 +50,9 @@ fn main() {
     let Some(_tray) = tray::Tray::new() else {
         return;
     };
+
+    // 注册表变更监听：系统设置等外部改动时投 WM_SETTINGS_CHANGED 给隐藏窗口。
+    watch::start(hidden);
 
     // 调试钩子：置 WNS_DEBUG_FLYOUT 时启动后立即弹出浮窗（截图校对布局用）。
     // 锚点取屏幕右下角附近，模拟真实托盘位置。
@@ -125,6 +130,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // 周期 timer，动画播完由 flyout 自行 KillTimer。
                 flyout::on_anim_tick();
             }
+            LRESULT(0)
+        }
+        // 被监听的注册表键变了（系统设置等外部改动）：可见时同步浮窗控件。
+        m if m == watch::WM_SETTINGS_CHANGED => {
+            flyout::on_external_change();
             LRESULT(0)
         }
         WM_DESTROY => {
