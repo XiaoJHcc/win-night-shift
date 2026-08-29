@@ -54,8 +54,9 @@ fn main() {
     // 注册表变更监听：系统设置等外部改动时投 WM_SETTINGS_CHANGED 给隐藏窗口。
     watch::start(hidden);
 
-    // 调试钩子：置 WNS_DEBUG_FLYOUT 时启动后立即弹出浮窗（截图校对布局用）。
-    // 锚点取屏幕右下角附近，模拟真实托盘位置。
+    // 调试钩子：置 WNS_DEBUG_FLYOUT 时启动后立即弹出浮窗（截图校对布局用），
+    // 且失焦不收起（见 flyout::init 的 PINNED）。锚点取屏幕右下角附近，
+    // 模拟真实托盘位置。
     #[cfg(debug_assertions)]
     if std::env::var_os("WNS_DEBUG_FLYOUT").is_some() {
         flyout::toggle_at(tray_icon::Rect {

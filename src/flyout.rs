@@ -36,7 +36,7 @@ use winui3::bootstrap::PackageDependency;
 use winui3::Microsoft::UI::Dispatching::DispatcherQueueController;
 use winui3::Microsoft::UI::Windowing::{AppWindow, OverlappedPresenter};
 use winui3::Microsoft::UI::Xaml::Controls::Primitives::{
-    RangeBaseValueChangedEventArgs, RangeBaseValueChangedEventHandler,
+    RangeBaseValueChangedEventArgs, RangeBaseValueChangedEventHandler, ToggleButton,
 };
 use winui3::Microsoft::UI::Xaml::Controls::{
     AppBarButton, Border, ColumnDefinition, CommandBarLabelPosition, FontIcon, Grid, Orientation,
@@ -48,11 +48,14 @@ use winui3::Microsoft::UI::Xaml::Media::{Brush, DesktopAcrylicBackdrop};
 use winui3::Microsoft::UI::Xaml::{
     Application, CornerRadius, ElementTheme, FrameworkElement, GridLength, GridUnitType,
     HorizontalAlignment, LaunchActivatedEventArgs, ResourceDictionary, RoutedEventHandler,
-    Thickness, UIElement, VerticalAlignment,
+    TextAlignment, Thickness, UIElement, VerticalAlignment,
 };
 use winui3::{XamlApp, XamlAppOverrides};
 
 /// 面板逻辑尺寸（96dpi 基准），高度按下列常量累加得出。
+///
+/// 布局照快速设置面板：顶部三枚瓦片 → 分隔线 → 拉条 → 分隔线 →
+/// 开机自启行 → 分隔线 → 底栏，全部直接坐在亚克力上，无卡片。
 ///
 /// 不做运行时测量：`DesktopWindowXamlSource` 的内容树量不出可用的高度
 /// （手动 `Measure` 早于模板套用、`ActualHeight` 是布局后的值、`DesiredSize` 返回 0），
@@ -60,49 +63,52 @@ use winui3::{XamlApp, XamlAppOverrides};
 /// 改布局时同步改这里。
 const PANEL_W: i32 = 320;
 
-/// 设置行高：开关/拉条的 `MinHeight`（32）上下各留 4。
+/// 瓦片按钮高，与快速设置的瓦片同形。
+const TILE_H: i32 = 48;
+/// 瓦片与其下方文字标签的间距。
+const TILE_LABEL_GAP: i32 = 8;
+/// 瓦片下方文字标签行高（FontSize 12）。
+const LABEL_H: i32 = 20;
+/// 拉条与开机自启行高：控件的 `MinHeight`（32）上下各留 4。
 const ROW_H: i32 = 40;
-/// 卡片上下内边距各 10，见 make_card。
-const CARD_PAD_V: i32 = 10;
-/// 普通单行卡片总高（深色模式/开机自启）：行高 + 上下内边距 + 上下 1px 描边。
-/// 描边在内边距外侧（Border 的 Padding 不含 BorderThickness），漏算它会让面板偏矮、
-/// 最下面一张卡的底边描边被窗口下缘裁掉。
-const CARD_H: i32 = CARD_PAD_V * 2 + ROW_H + 2;
-/// 夜间模式卡片：开关行 + 拉条行，两行。
-const NIGHT_CARD_H: i32 = CARD_PAD_V * 2 + ROW_H * 2 + 2;
-/// 标题行：FontSize 14 的单行文本约 20，加下边距 2。
-const TITLE_H: i32 = 22;
-/// 标题与各卡片间距，见 make_content 里 panel 的 Spacing。
-const CARD_GAP: i32 = 8;
-/// 内容区上下内边距各 12，见 make_content 里 content 的 Padding。
-const CONTENT_PAD_V: i32 = 12;
+/// 分隔线高 1px，与相邻区块的间距。
+const SEP_H: i32 = 1;
+const SEP_GAP: i32 = 12;
+/// 面板横向内边距（瓦片区/拉条/开机自启行共用），快速设置取 16 一档。
+const PAD_H: i32 = 16;
+/// 顶部内边距。
+const TOP_PAD: i32 = 16;
 /// 底栏高度：`AppBarThemeCompactHeight`。
 const FOOTER_H: i32 = 48;
-/// 内容区底边分隔线 1px。
-const SEP_H: i32 = 1;
 
-/// 面板高度 = 内容区 + 分隔线 + 底栏。三张卡片：夜间模式双行卡 + 两张单行卡，
-/// 标题加三卡共四个子元素、三个间距。
-const PANEL_H: i32 =
-    CONTENT_PAD_V * 2 + TITLE_H + CARD_GAP * 3 + NIGHT_CARD_H + CARD_H * 2 + SEP_H + FOOTER_H;
+/// 面板高度 = 顶边距 + 瓦片区 + 分隔线 + 拉条行 + 分隔线 + 自启行 + 分隔线 + 底栏。
+/// 底栏前那条分隔线只有上间距（底栏自带留白）。
+const PANEL_H: i32 = TOP_PAD
+    + (TILE_H + TILE_LABEL_GAP + LABEL_H)
+    + (SEP_GAP + SEP_H + SEP_GAP)
+    + ROW_H
+    + (SEP_GAP + SEP_H + SEP_GAP)
+    + ROW_H
+    + (SEP_GAP + SEP_H)
+    + FOOTER_H;
 /// 面板与托盘图标之间的间距（逻辑像素）。
 const GAP: i32 = 8;
 
-/// 强度拉条定宽：系统设置里的拉条不随布局拉伸，固定宽度让各卡片右侧控件边缘对齐。
-const SLIDER_W: f64 = 130.0;
-
 /// 面板中的设置控件。
 struct Items {
-    night: ToggleSwitch,
+    night: ToggleButton,
     strength: Slider,
-    strength_label: TextBlock,
-    dark: ToggleSwitch,
+    /// 拉条右侧的色温值文本，随拉条实时更新。
+    kelvin: TextBlock,
+    dark: ToggleButton,
+    /// 原彩（True Tone）：仅预留占位，禁用态，无逻辑。
+    truetone: ToggleButton,
     autostart: ToggleSwitch,
 }
 
-/// 强度标签文案：百分比 + 约值色温。
-fn strength_text(p: u32) -> String {
-    format!("强度 {p}%（约 {}K）", crate::nightlight::strength_to_kelvin(p))
+/// 色温值文本：如「6500K」。
+fn kelvin_text(p: u32) -> String {
+    format!("{}K", crate::nightlight::strength_to_kelvin(p))
 }
 
 impl Items {
@@ -116,15 +122,19 @@ impl Items {
         let night = crate::nightlight::get_enabled().unwrap_or(false);
         let strength = crate::nightlight::get_strength().unwrap_or(50);
         with_syncing(|| {
-            let _ = self.night.SetIsOn(night);
+            let _ = set_checked(&self.night, night);
             let _ = self.strength.SetValue2(f64::from(strength));
-            let _ = self.dark.SetIsOn(crate::theme::is_dark());
+            let _ = self.kelvin.SetText(&HSTRING::from(kelvin_text(strength)));
+            let _ = set_checked(&self.dark, crate::theme::is_dark());
             let _ = self.autostart.SetIsOn(crate::autostart::is_autostart());
-            let _ = self
-                .strength_label
-                .SetText(&HSTRING::from(strength_text(strength)));
         });
     }
+}
+
+/// 程序化设置瓦片选中态：`IReference<bool>` 装箱。
+fn set_checked(btn: &ToggleButton, v: bool) -> Result<()> {
+    let rv: windows::Foundation::IReference<bool> = PropertyValue::CreateBoolean(v)?.cast()?;
+    btn.SetIsChecked(Some(&rv))
 }
 
 struct Flyout {
@@ -150,6 +160,8 @@ thread_local! {
     /// 强度滑条写注册表的节流状态：上次写入时刻与待补写的值。
     static LAST_WRITE: Cell<Instant> = Cell::new(Instant::now());
     static PENDING_STRENGTH: Cell<Option<u32>> = const { Cell::new(None) };
+    /// 调试钉住：置位时失焦不收起（仅 debug 构建，见 init）。
+    static PINNED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// 强度写注册表的最小间隔（毫秒）。拖动期间的密集写入会被 CloudStore
@@ -172,6 +184,12 @@ fn with_syncing(f: impl FnOnce()) {
 /// 预建而非按需建，是为了把约 40ms 的首帧开销挪到启动阶段，
 /// 让点击托盘时只剩 `Show`（约 10ms，无感）。
 pub fn init() -> bool {
+    // 调试钩子（与 main.rs 的 WNS_DEBUG_FLYOUT 联动）：自动弹出时一并钉住，
+    // 不因失焦收起，方便截图/自动化校对布局。仅 debug 构建生效。
+    #[cfg(debug_assertions)]
+    if std::env::var_os("WNS_DEBUG_FLYOUT").is_some() {
+        PINNED.with(|c| c.set(true));
+    }
     match build() {
         Ok(f) => {
             FLYOUT.with(|c| *c.borrow_mut() = Some(f));
@@ -257,8 +275,8 @@ fn slider_captured(slider: &Slider) -> bool {
 
 /// 展开/收起动画帧驱动（hidden 窗口 WM_TIMER 周期调用，见 main.rs）。
 ///
-/// 当前三张卡片高度固定、无展开态，timer 不会被启动；保留此入口与 lock-ime
-/// 的消息循环结构对齐，后续给卡片加展开区时由它逐帧驱动窗口尺寸动画。
+/// 当前面板高度固定、无展开态，timer 不会被启动；保留此入口与 lock-ime
+/// 的消息循环结构对齐，后续加展开区时由它逐帧驱动窗口尺寸动画。
 pub fn on_anim_tick() {}
 
 impl Flyout {
@@ -356,7 +374,10 @@ unsafe extern "system" fn subclass_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
-    if msg == WM_ACTIVATE && (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+    if msg == WM_ACTIVATE
+        && (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE
+        && !PINNED.with(|c| c.get())
+    {
         unsafe {
             let _ = PostMessageW(Some(hwnd), WM_FLYOUT_DISMISS, WPARAM(0), LPARAM(0));
         }
@@ -443,10 +464,8 @@ unsafe extern "system" fn enum_child_layout(child: HWND, lparam: LPARAM) -> BOOL
 
 /// 显式设了主题画刷的元素集合，供主题切换时重刷（见 apply_theme_brushes）。
 struct Themed {
-    /// 三张设置卡片：底色 + 描边。
-    cards: Vec<Border>,
-    /// 内容区底板：LayerOnAcrylic 底色 + 底边分隔线描边（归属说明见 make_content）。
-    content: Border,
+    /// 三条分隔线：底色即线色。
+    separators: Vec<Border>,
     /// 主题画刷的来源字典：挂进 Application 的那份 XamlControlsResources。
     /// 激活失败时为 None，set_brush 回退到顶层 Lookup。
     dict: Option<ResourceDictionary>,
@@ -498,63 +517,115 @@ where
     Ok(())
 }
 
-/// 显式画刷的统一应用点：卡片与内容区的底色/描边。
+/// 显式画刷的统一应用点：分隔线颜色。
 ///
-/// 两个卡片键都来自 WinUI 主题资源，与「系统 › 屏幕」里的卡片同源：
-///  * `CardBackgroundFillColorDefaultBrush` —— 卡片底色
-///  * `CardStrokeColorDefaultBrush` —— 1px 描边
+/// 分隔线键取自 WinUI 主题资源 `DividerStrokeColorDefaultBrush`
+/// （MenuFlyoutSeparator 等系统分隔线同源）。
 ///
 /// 必须集中在这一处、且能被反复调用：控件模板里的 ThemeResource 在系统主题
 /// 切换时会自动重解析，而代码里 SetBackground 上去的画刷不会——它固化着
 /// 取出那一刻的主题色，曾导致运行期间切换亮/暗后「模板部分（文字/开关）
-/// 已跟随、卡片与内容区仍是旧主题色」的混搭。构建时应用一次，之后由 root 的
+/// 已跟随、显式画刷仍是旧主题色」的混搭。构建时应用一次，之后由 root 的
 /// `ActualThemeChanged` 事件回调按新主题重刷（见 build）。
 fn apply_theme_brushes(t: &Themed, theme: ElementTheme) {
     let dict = t.dict.as_ref();
-    for card in &t.cards {
-        let _ = set_brush(dict, theme, "CardBackgroundFillColorDefaultBrush", |b| {
-            card.SetBackground(b)
-        });
-        let _ = set_brush(dict, theme, "CardStrokeColorDefaultBrush", |b| {
-            card.SetBorderBrush(b)
+    for sep in &t.separators {
+        let _ = set_brush(dict, theme, "DividerStrokeColorDefaultBrush", |b| {
+            sep.SetBackground(b)
         });
     }
-    let _ = set_brush(dict, theme, "LayerOnAcrylicFillColorDefaultBrush", |b| {
-        t.content.SetBackground(b)
-    });
-    let _ = set_brush(dict, theme, "CardStrokeColorDefaultBrush", |b| {
-        t.content.SetBorderBrush(b)
-    });
 }
 
-/// Win11 设置页那种卡片：圆角 + 描边 + 主题背景。
+/// 快速设置式瓦片：48 高的 ToggleButton + 下方居中文字标签。
 ///
-/// 这里只负责几何（圆角/描边宽度/内边距）；底色与描边画刷由
-/// `apply_theme_brushes` 统一应用并随主题重刷，画刷键的说明见该函数。
-/// 圆角 8 对应 `OverlayCornerRadius` 档位：设置页里的卡片、快速设置面板里的
-/// 分组块用的都是这一档；`ControlCornerRadius`（4）是按钮/输入框那种控件级圆角，
-/// 用在卡片上会明显偏小。
-fn make_card() -> Result<Border> {
-    let card = Border::new()?;
-    card.SetBorderThickness(Thickness {
-        Left: 1.0,
-        Top: 1.0,
-        Right: 1.0,
-        Bottom: 1.0,
+/// 瓦片即 `ToggleButton` 默认模板——它的 Checked 态背景就是
+/// `AccentFillColorDefaultBrush`（强调色底+反白前景），正是快速设置里
+/// 「已开启」瓦片的样子，不需要自绘。圆角用 `ControlCornerRadius`（4）小圆角，
+/// 与按钮/输入框等控件级圆角一致。
+///
+/// 图标归一化：FontIcon 默认字号 20（`icon.cpp` 的 `g_ClientCoreFontSize`），
+/// 系统瓦片图标是 16，这里显式压到 16。
+fn make_tile(btn: &ToggleButton, label: &str) -> Result<StackPanel> {
+    btn.SetHeight(f64::from(TILE_H))?;
+    btn.SetHorizontalAlignment(HorizontalAlignment::Stretch)?;
+    btn.SetCornerRadius(CornerRadius {
+        TopLeft: 4.0,
+        TopRight: 4.0,
+        BottomRight: 4.0,
+        BottomLeft: 4.0,
     })?;
-    card.SetCornerRadius(CornerRadius {
-        TopLeft: 8.0,
-        TopRight: 8.0,
-        BottomRight: 8.0,
-        BottomLeft: 8.0,
+
+    let tb = TextBlock::new()?;
+    tb.SetText(&HSTRING::from(label))?;
+    tb.SetFontSize(12.0)?;
+    tb.SetHorizontalAlignment(HorizontalAlignment::Center)?;
+    tb.SetMargin(Thickness {
+        Left: 0.0,
+        Top: f64::from(TILE_LABEL_GAP),
+        Right: 0.0,
+        Bottom: 0.0,
     })?;
-    card.SetPadding(Thickness {
-        Left: 14.0,
-        Top: f64::from(CARD_PAD_V),
-        Right: 14.0,
-        Bottom: f64::from(CARD_PAD_V),
+
+    let tile = StackPanel::new()?;
+    tile.Children()?.Append(btn)?;
+    tile.Children()?.Append(&tb)?;
+    Ok(tile)
+}
+
+/// 瓦片按钮本体：图标为唯一内容。
+fn make_tile_button(glyph: &str) -> Result<ToggleButton> {
+    let btn = ToggleButton::new()?;
+    let icon = FontIcon::new()?;
+    icon.SetGlyph(&HSTRING::from(glyph))?;
+    icon.SetFontSize(16.0)?;
+    btn.SetContent(&icon.cast::<IInspectable>()?)?;
+    Ok(btn)
+}
+
+/// 顶部瓦片区：深色模式 / 夜间模式 / 原彩（预留），三列等宽、列间距 8。
+fn make_tiles(items: &Items) -> Result<Grid> {
+    let grid = Grid::new()?;
+    grid.SetColumnSpacing(8.0)?;
+    grid.SetMargin(Thickness {
+        Left: f64::from(PAD_H),
+        Top: f64::from(TOP_PAD),
+        Right: f64::from(PAD_H),
+        Bottom: 0.0,
     })?;
-    Ok(card)
+    for _ in 0..3 {
+        let col = ColumnDefinition::new()?;
+        col.SetWidth(GridLength {
+            Value: 1.0,
+            GridUnitType: GridUnitType::Star,
+        })?;
+        grid.ColumnDefinitions()?.Append(&col)?;
+    }
+    let defs = [
+        (&items.dark, "深色模式"),
+        (&items.night, "夜间模式"),
+        (&items.truetone, "原彩"),
+    ];
+    for (i, (btn, label)) in defs.iter().enumerate() {
+        let tile = make_tile(btn, label)?;
+        Grid::SetColumn(&tile, i as i32)?;
+        grid.Children()?.Append(&tile)?;
+    }
+    Ok(grid)
+}
+
+/// 通栏分隔线：1px 高、通栏拉伸；线色由 apply_theme_brushes 按主题应用。
+/// 快速设置的分隔线贴边贯通，因此不随内容区内边距缩进。
+fn make_separator(top: f64, bottom: f64) -> Result<Border> {
+    let sep = Border::new()?;
+    sep.SetHeight(f64::from(SEP_H))?;
+    sep.SetHorizontalAlignment(HorizontalAlignment::Stretch)?;
+    sep.SetMargin(Thickness {
+        Left: 0.0,
+        Top: top,
+        Right: 0.0,
+        Bottom: bottom,
+    })?;
+    Ok(sep)
 }
 
 /// 卡片左侧的单行标签。
@@ -594,55 +665,12 @@ fn set_row_control(row: &Grid, ctl: &UIElement) -> Result<()> {
     Ok(())
 }
 
-/// 单开关卡片（深色模式 / 开机自启）：左标签 + 右开关。
-fn make_switch_card(label: &str, sw: &ToggleSwitch) -> Result<Border> {
-    let row = make_setting_row(label, f64::from(ROW_H))?;
-    set_row_control(&row, &sw.cast()?)?;
-    let card = make_card()?;
-    card.SetChild(&row)?;
-    Ok(card)
-}
-
-/// 夜间模式卡片：第一行「启用夜间模式」开关，第二行强度拉条，
-/// 拉条左侧标签实时显示百分比与约值色温。
-fn make_night_card(items: &Items) -> Result<Border> {
-    let rows = StackPanel::new()?;
-
-    let sw_row = make_setting_row("启用夜间模式", f64::from(ROW_H))?;
-    set_row_control(&sw_row, &items.night.cast()?)?;
-    rows.Children()?.Append(&sw_row)?;
-
-    // 强度行：标签内容随拉条值变化，用 Items 里持有的那个 TextBlock。
-    let st_row = Grid::new()?;
-    st_row.SetHorizontalAlignment(HorizontalAlignment::Stretch)?;
-    st_row.SetMinHeight(f64::from(ROW_H))?;
-    for t in [GridUnitType::Star, GridUnitType::Auto] {
-        let col = ColumnDefinition::new()?;
-        col.SetWidth(GridLength {
-            Value: 1.0,
-            GridUnitType: t,
-        })?;
-        st_row.ColumnDefinitions()?.Append(&col)?;
-    }
-    items
-        .strength_label
-        .SetVerticalAlignment(VerticalAlignment::Center)?;
-    Grid::SetColumn(&items.strength_label, 0)?;
-    st_row.Children()?.Append(&items.strength_label)?;
-    set_row_control(&st_row, &items.strength.cast()?)?;
-    rows.Children()?.Append(&st_row)?;
-
-    let card = make_card()?;
-    card.SetChild(&rows)?;
-    Ok(card)
-}
-
 /// 底栏：右对齐的退出图标按钮。
 ///
-/// 不设背景、不设边框——背景即浮窗基底（亚克力本身），分隔线归上方内容区的底边。
+/// 不设背景、不设边框——背景即浮窗基底（亚克力本身），与上方区块的分隔
+/// 由独立的分隔线元素承担（见 populate_root）。
 ///
-/// 左右内边距与内容区取同一个值：`ContentDialog` 模板里 `CommandSpace.Padding`
-/// 和内容区 Padding 绑的是同一个键 `ContentDialogPadding`，底栏并非通栏无边距；
+/// 左右内边距与内容区取同一个值：底栏并非通栏无边距，
 /// 少了它，悬停底板会贴到浮窗边缘。上下不留，由 `FOOTER_H` 给高度即可。
 fn make_footer() -> Result<Border> {
     let bar = StackPanel::new()?;
@@ -661,7 +689,7 @@ fn make_footer() -> Result<Border> {
 
     let footer = Border::new()?;
     footer.SetMinHeight(f64::from(FOOTER_H))?;
-    let pad = f64::from(CONTENT_PAD_V);
+    let pad = f64::from(PAD_H);
     footer.SetPadding(Thickness {
         Left: pad,
         Top: 0.0,
@@ -703,57 +731,86 @@ fn make_command_button(glyph: &str, label: &str) -> Result<AppBarButton> {
     Ok(b)
 }
 
-/// 内容区：标题 + 三张设置卡片，底边带分隔线。
-///
-/// 抬亮的是**内容区**而非底栏，这是照 `ContentDialog` 模板的归属：
-/// 内容区 `Background = ContentDialogTopOverlay`（→ `LayerFillColorAltBrush`），
-/// 底栏 `Background = {TemplateBinding Background}` 即对话框基底、不做抬亮，
-/// 视觉上是「上亮下透」。浮窗坐在亚克力上，故换成 `LayerOnAcrylic` 那一支。
-///
-/// 分隔线同样归内容区：模板里 `BorderThickness="0,0,0,1"` 挂在内容区**底边**。
-/// `cards` 收集显式设主题画刷的卡片，供 apply_theme_brushes 重刷。
-fn make_content(items: &Items, cards: &mut Vec<Border>) -> Result<Border> {
-    let panel = StackPanel::new()?;
-    panel.SetSpacing(f64::from(CARD_GAP))?;
+/// 把各区块装进食根面板：瓦片区 → 分隔线 → 强度拉条 → 分隔线 →
+/// 开机自启行 → 分隔线 → 底栏。全部直接坐在亚克力基底上，不用卡片。
+/// `separators` 收集显式设主题画刷的分隔线，供 apply_theme_brushes 重刷。
+fn populate_root(root: &StackPanel, items: &Items, separators: &mut Vec<Border>) -> Result<()> {
+    let tiles = make_tiles(items)?;
+    root.Children()?.Append(&tiles)?;
 
-    let title = TextBlock::new()?;
-    title.SetText(h!("win-night-shift"))?;
-    title.SetFontSize(14.0)?;
-    title.SetFontWeight(windows::UI::Text::FontWeights::SemiBold()?)?;
-    title.SetMargin(Thickness {
-        Left: 2.0,
-        Top: 0.0,
-        Right: 0.0,
-        Bottom: 2.0,
-    })?;
-    panel.Children()?.Append(&title)?;
+    let sep1 = make_separator(f64::from(SEP_GAP), f64::from(SEP_GAP))?;
+    root.Children()?.Append(&sep1)?;
+    separators.push(sep1);
 
-    let night_card = make_night_card(items)?;
-    panel.Children()?.Append(&night_card)?;
-    cards.push(night_card);
-    let dark_card = make_switch_card("深色模式", &items.dark)?;
-    panel.Children()?.Append(&dark_card)?;
-    cards.push(dark_card);
-    let auto_card = make_switch_card("开机自启", &items.autostart)?;
-    panel.Children()?.Append(&auto_card)?;
-    cards.push(auto_card);
-
-    let content = Border::new()?;
-    content.SetBorderThickness(Thickness {
-        Left: 0.0,
-        Top: 0.0,
-        Right: 0.0,
-        Bottom: 1.0,
-    })?;
-    let pad = f64::from(CONTENT_PAD_V);
-    content.SetPadding(Thickness {
+    // 强度拉条行：左「色温」标签 + 拉条拉伸 + 右侧实时色温值。
+    let pad = f64::from(PAD_H);
+    let row = Grid::new()?;
+    row.SetMinHeight(f64::from(ROW_H))?;
+    row.SetMargin(Thickness {
         Left: pad,
-        Top: pad,
+        Top: 0.0,
         Right: pad,
-        Bottom: pad,
+        Bottom: 0.0,
     })?;
-    content.SetChild(&panel)?;
-    Ok(content)
+    for t in [GridUnitType::Auto, GridUnitType::Star, GridUnitType::Auto] {
+        let col = ColumnDefinition::new()?;
+        col.SetWidth(GridLength {
+            Value: 1.0,
+            GridUnitType: t,
+        })?;
+        row.ColumnDefinitions()?.Append(&col)?;
+    }
+
+    let caption = make_label("色温")?;
+    Grid::SetColumn(&caption, 0)?;
+    row.Children()?.Append(&caption)?;
+
+    items
+        .strength
+        .SetHorizontalAlignment(HorizontalAlignment::Stretch)?;
+    items.strength.SetVerticalAlignment(VerticalAlignment::Center)?;
+    items.strength.SetMargin(Thickness {
+        Left: 8.0,
+        Top: 0.0,
+        Right: 8.0,
+        Bottom: 0.0,
+    })?;
+    Grid::SetColumn(&items.strength, 1)?;
+    row.Children()?.Append(&items.strength)?;
+
+    // 值右对齐：1200K..6500K 恒为 5 字符，给足定宽避免数字跳动时整行抖动。
+    items.kelvin.SetMinWidth(44.0)?;
+    items.kelvin.SetTextAlignment(TextAlignment::Right)?;
+    items
+        .kelvin
+        .SetVerticalAlignment(VerticalAlignment::Center)?;
+    Grid::SetColumn(&items.kelvin, 2)?;
+    row.Children()?.Append(&items.kelvin)?;
+
+    root.Children()?.Append(&row)?;
+
+    let sep2 = make_separator(f64::from(SEP_GAP), f64::from(SEP_GAP))?;
+    root.Children()?.Append(&sep2)?;
+    separators.push(sep2);
+
+    // 开机自启行：左标签 + 右开关，直接放背景上。
+    let row = make_setting_row("开机自启", f64::from(ROW_H))?;
+    row.SetMargin(Thickness {
+        Left: pad,
+        Top: 0.0,
+        Right: pad,
+        Bottom: 0.0,
+    })?;
+    set_row_control(&row, &items.autostart.cast()?)?;
+    root.Children()?.Append(&row)?;
+
+    // 底栏前的分隔线只留上间距：底栏自身高度已含留白。
+    let sep3 = make_separator(f64::from(SEP_GAP), 0.0)?;
+    root.Children()?.Append(&sep3)?;
+    separators.push(sep3);
+
+    root.Children()?.Append(&make_footer()?)?;
+    Ok(())
 }
 
 fn make_toggle() -> Result<ToggleSwitch> {
@@ -799,7 +856,7 @@ fn build() -> Result<Flyout> {
 
     let root = StackPanel::new()?;
 
-    // 必须在任何 make_card / set_brush 之前：控件模板与主题画刷都在这份字典里。
+    // 必须在任何 make_tile / set_brush 之前：控件模板与主题画刷都在这份字典里。
     // 合并到 Application 级而非 root；画刷另从这份字典的 ThemeDictionaries 按
     // 实际主题精确取（见 set_brush），故保留字典本身一份引用。
     // 前提是 XamlApp::compose 已在 WindowsXamlManager 之前建立带元数据 provider
@@ -813,35 +870,37 @@ fn build() -> Result<Flyout> {
     };
 
     // 各控件的状态先留默认，与值一并在 SetContent 之后由 sync 落实（原因见 Items::sync）。
+    //
+    // 瓦片图标取自 Segoe Fluent Icons，与系统对应入口同款：
+    //  * 深色模式 U+E790 Color —— 「个性化 › 颜色」页（深色模式设置所在地）的图标；
+    //  * 夜间模式 U+E708 QuietHours（月亮）—— 快速设置「夜间模式」瓦片的图标；
+    //  * 原彩 U+E706 Brightness —— 随环境光调节，取亮度图标；仅预留，禁用。
     let strength = Slider::new()?;
     strength.SetMinimum(0.0)?;
     strength.SetMaximum(100.0)?;
     strength.SetStepFrequency(1.0)?;
-    strength.SetWidth(SLIDER_W)?;
+
+    let truetone = make_tile_button("\u{E706}")?;
+    truetone.SetIsEnabled(false)?;
 
     let items = Items {
-        night: make_toggle()?,
+        night: make_tile_button("\u{E708}")?,
         strength,
-        strength_label: TextBlock::new()?,
-        dark: make_toggle()?,
+        kelvin: TextBlock::new()?,
+        dark: make_tile_button("\u{E790}")?,
+        truetone,
         autostart: make_toggle()?,
     };
     bind_controls(&items)?;
 
-    let mut cards = Vec::new();
-    let content = make_content(&items, &mut cards)?;
-    let themed = Themed {
-        cards,
-        content: content.clone(),
-        dict,
-    };
-    root.Children()?.Append(&content)?;
-    root.Children()?.Append(&make_footer()?)?;
+    let mut separators = Vec::new();
+    populate_root(&root, &items, &mut separators)?;
+    let themed = Themed { separators, dict };
 
     src.SetContent(&root)?;
 
     // 显式画刷按当前实际主题应用一次；此后由 ActualThemeChanged 跟随系统主题
-    // 切换重刷（固化的画刷曾导致运行期间切换亮/暗后卡片/内容区停在旧主题色，
+    // 切换重刷（固化的画刷曾导致运行期间切换亮/暗后停在旧主题色，
     // 见 apply_theme_brushes）。
     let root_fe = root.cast::<FrameworkElement>()?;
     apply_theme_brushes(&themed, root_fe.ActualTheme().unwrap_or(ElementTheme::Light));
@@ -903,12 +962,12 @@ fn build() -> Result<Flyout> {
 /// 把控件事件绑到注册表写入。所有回调先查 `is_syncing`：程序化写值（sync）不触发回写。
 /// 写入失败（返回 false）时 refresh 一遍，把控件扳回真实状态。
 fn bind_controls(items: &Items) -> Result<()> {
-    bind_switch(&items.night, |v| {
+    bind_tile(&items.night, |v| {
         if !crate::nightlight::set_enabled(v) {
             refresh();
         }
     })?;
-    bind_switch(&items.dark, |v| {
+    bind_tile(&items.dark, |v| {
         if !crate::theme::set_dark(v) {
             refresh();
         }
@@ -919,18 +978,18 @@ fn bind_controls(items: &Items) -> Result<()> {
         }
     })?;
 
-    let label = items.strength_label.clone();
+    let kelvin = items.kelvin.clone();
     items.strength.ValueChanged(&RangeBaseValueChangedEventHandler::new(
         move |_, args: Ref<'_, RangeBaseValueChangedEventArgs>| {
             if is_syncing() {
                 return Ok(());
             }
             let p = args.ok()?.NewValue()?.round().clamp(0.0, 100.0) as u32;
-            // 标签实时更新，但注册表写做节流：拖动会高频触发 ValueChanged，
+            // 色温值实时更新，但注册表写做节流：拖动会高频触发 ValueChanged，
             // 对 CloudStore 的密集外部写入会被系统判定冲突（实测会把夜间模式
             // 打回关闭）。两次写至少间隔 WRITE_THROTTLE，期间的值记入 PENDING，
             // 松手（PointerCaptureLost）时补写最后一笔。
-            let _ = label.SetText(&HSTRING::from(strength_text(p)));
+            let _ = kelvin.SetText(&HSTRING::from(kelvin_text(p)));
             let now = Instant::now();
             let due = LAST_WRITE.with(|c| {
                 now.duration_since(c.get()).as_millis() >= WRITE_THROTTLE.as_millis()
@@ -949,6 +1008,19 @@ fn bind_controls(items: &Items) -> Result<()> {
         if let Some(p) = PENDING_STRENGTH.with(|c| c.take()) {
             LAST_WRITE.with(|c| c.set(Instant::now()));
             crate::nightlight::set_strength(p);
+        }
+        Ok(())
+    }))?;
+    Ok(())
+}
+
+/// 瓦片开关：Click 只在用户点按时触发（程序化 SetIsChecked 不触发），
+/// 天然避开 sync 回环；is_syncing 判定仅作保险。
+fn bind_tile<F: Fn(bool) + Send + 'static>(btn: &ToggleButton, f: F) -> Result<()> {
+    let b = btn.clone();
+    btn.Click(&RoutedEventHandler::new(move |_, _| {
+        if !is_syncing() {
+            f(b.IsChecked().ok().and_then(|r| r.Value().ok()).unwrap_or(false));
         }
         Ok(())
     }))?;
