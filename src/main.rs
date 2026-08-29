@@ -25,6 +25,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// 保留分发与 lock-ime 的消息循环结构对齐（见 flyout::on_anim_tick）。
 pub const TIMER_FLYOUT_ANIM: usize = 1;
 
+/// 注册表监听命中（见 wndproc 的 WM_SETTINGS_CHANGED）后置位，主循环下轮
+/// 刷新托盘图标——亮/暗主题切换要立即反映到托盘 glyph 颜色上。
+/// 夜间模式键的变更也会置位，refresh 是幂等重算，代价可忽略。
+static TRAY_ICON_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn main() {
     // 声明 Per-Monitor-V2 DPI 感知：必须在创建任何窗口之前调用，
     // 否则浮窗会被系统位图拉伸，在高 DPI 下发虚。
@@ -92,6 +97,11 @@ fn main() {
             }
         }
         tray.handle_menu_events();
+
+        // 注册表监听命中过：按当前任务栏主题重选托盘图标（亮/暗切换即时生效）。
+        if TRAY_ICON_DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            tray.refresh_icon();
+        }
     }
 }
 
@@ -137,9 +147,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             LRESULT(0)
         }
-        // 被监听的注册表键变了（系统设置等外部改动）：可见时同步浮窗控件。
+        // 被监听的注册表键变了（系统设置等外部改动）：同步浮窗控件，
+        // 并标记主循环刷新托盘图标（亮/暗主题切换要换 glyph 颜色）。
         m if m == watch::WM_SETTINGS_CHANGED => {
             flyout::on_external_change();
+            TRAY_ICON_DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
             LRESULT(0)
         }
         WM_DESTROY => {

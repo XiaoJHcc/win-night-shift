@@ -1,8 +1,14 @@
 //! 系统托盘图标。
 //!
-//! 图标来源：构建期嵌入的 img/icon.ico（资源 ID 1）；素材未提供时回退到
-//! 系统库存图标（IDI_INFORMATION）栅格化为 RGBA —— 用的是系统图标，
-//! 不做任何自绘。
+//! 图标来源：include_bytes! 内嵌的 img/tray-white.ico / tray-black.ico
+//! （lucide moon，由 examples/makeicon.rs 生成），按任务栏主题二选一——
+//! 深色任务栏用白色 glyph、浅色用近黑 glyph，与系统自带托盘图标一致；
+//! 主题依据是 HKCU Personalize 键的 SystemUsesLightTheme（系统界面亮暗）。
+//! 从中挑最接近 SM_CXSMICON 的尺寸档解码为 RGBA，不做缩放（缩放会糊）。
+//! 解码失败回退系统库存图标（IDI_INFORMATION）。
+//!
+//! exe 自身的应用图标是另一份琥珀色 img/icon.ico（资源 ID 1，build.rs 嵌入），
+//! 与托盘图标独立。
 //!
 //! 左右键分工：
 //!  * 左键不挂菜单（`with_menu_on_left_click(false)`）：只发 TrayIconEvent，
@@ -16,7 +22,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use windows::Win32::UI::WindowsAndMessaging::PostQuitMessage;
 
 pub struct Tray {
-    _tray: TrayIcon,
+    tray: TrayIcon,
     /// 「开机自启」勾选项。muda 在投事件前已自动翻转勾选态（见
     /// muda::platform_impl::windows 的 menu_selected），处理时现读即为目标值。
     autostart_item: CheckMenuItem,
@@ -24,14 +30,44 @@ pub struct Tray {
     quit_id: MenuId,
 }
 
+/// 内嵌托盘图标：深色任务栏用白色 glyph，浅色任务栏用近黑 glyph。
+/// 文件由 examples/makeicon.rs 生成，缺失会直接编译失败（素材应已入库）。
+const TRAY_ICON_FOR_DARK_TASKBAR: &[u8] = include_bytes!("../img/tray-white.ico");
+const TRAY_ICON_FOR_LIGHT_TASKBAR: &[u8] = include_bytes!("../img/tray-black.ico");
+
+/// HKCU Personalize 键：SystemUsesLightTheme 是系统界面（任务栏等）亮暗。
+const PERSONALIZE_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+
 fn make_icon() -> Option<Icon> {
-    // 构建期嵌入了 icon.ico 时走这里。
-    if let Ok(icon) = Icon::from_resource(1, Some((16, 16))) {
+    let bytes = if taskbar_is_light() {
+        TRAY_ICON_FOR_LIGHT_TASKBAR
+    } else {
+        TRAY_ICON_FOR_DARK_TASKBAR
+    };
+    if let Some(icon) = bundled_icon(bytes) {
         return Some(icon);
     }
-    // 素材未提供：回退到系统库存图标。
+    // 解码失败（不应发生）：回退到系统库存图标。
     let (rgba, w, h) = stock_icon_rgba()?;
     Icon::from_rgba(rgba, w, h).ok()
+}
+
+/// 任务栏是否为浅色主题；读不到时按深色处理（白 glyph 在深色底上安全）。
+fn taskbar_is_light() -> bool {
+    crate::reg::read_dword(PERSONALIZE_KEY, "SystemUsesLightTheme") == Some(1)
+}
+
+/// 从内嵌 ico 挑尺寸档解码：优先不小于系统托盘图标尺寸（SM_CXSMICON，
+/// 进程 DPI 感知下已含缩放）的最小档，没有则取最大档——原尺寸解码不缩放。
+fn bundled_icon(bytes: &[u8]) -> Option<Icon> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+    let want = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(1) as u32;
+    let dir = ico::IconDir::read(std::io::Cursor::new(bytes)).ok()?;
+    let mut entries: Vec<_> = dir.entries().iter().collect();
+    entries.sort_by_key(|e| e.width());
+    let entry = entries.iter().find(|e| e.width() >= want).or(entries.last())?;
+    let img = entry.decode().ok()?;
+    Icon::from_rgba(img.rgba_data().to_vec(), img.width(), img.height()).ok()
 }
 
 impl Tray {
@@ -57,10 +93,18 @@ impl Tray {
             builder = builder.with_icon(icon);
         }
         Some(Tray {
-            _tray: builder.build().ok()?,
+            tray: builder.build().ok()?,
             autostart_item,
             quit_id,
         })
+    }
+
+    /// 按当前任务栏主题重选托盘图标（系统亮/暗切换后由主循环调用，
+    /// 见 main.rs 的 TRAY_ICON_DIRTY）。解码失败时保持旧图标。
+    pub fn refresh_icon(&self) {
+        if let Some(icon) = make_icon() {
+            let _ = self.tray.set_icon(Some(icon));
+        }
     }
 
     /// 处理右键菜单项点击（主循环每轮泵一次）。

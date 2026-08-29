@@ -6,6 +6,8 @@ description = "常驻托盘的 Windows 小工具：夜间模式开关/强度拉�
 
 [dependencies]
 tray-icon = "0.19"
+# 运行时解码 include_bytes! 内嵌的托盘 .ico（见 src/tray.rs）。
+ico = "0.4"
 
 [dependencies.windows]
 version = "0.61"
@@ -44,6 +46,10 @@ features = [
 
 [build-dependencies]
 winresource = "0.1"
+
+# 仅供 examples/makeicon.rs（一次性图标生成器）使用，不进正式二进制。
+[dev-dependencies]
+resvg = { version = "0.45", default-features = false }
 
 [profile.release]
 opt-level = "z"

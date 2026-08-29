@@ -1,1 +1,3 @@
 /target
+# makeicon 生成的目检图，可随时重新生成，不入库
+img/preview-*.png
