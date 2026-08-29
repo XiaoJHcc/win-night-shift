@@ -17,8 +17,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
-use windows::core::{h, Interface, Ref, Result, BOOL, HSTRING};
-use windows::Foundation::PropertyValue;
+use windows::core::{h, IInspectable, Interface, Ref, Result, BOOL, HSTRING};
+use windows::Foundation::{PropertyValue, TypedEventHandler};
 use windows::Graphics::{RectInt32, SizeInt32};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -46,8 +46,9 @@ use winui3::Microsoft::UI::Xaml::Hosting::{DesktopWindowXamlSource, WindowsXamlM
 use winui3::Microsoft::UI::Xaml::Input::PointerEventHandler;
 use winui3::Microsoft::UI::Xaml::Media::{Brush, DesktopAcrylicBackdrop};
 use winui3::Microsoft::UI::Xaml::{
-    Application, CornerRadius, FrameworkElement, GridLength, GridUnitType, HorizontalAlignment,
-    LaunchActivatedEventArgs, RoutedEventHandler, Thickness, UIElement, VerticalAlignment,
+    Application, CornerRadius, ElementTheme, FrameworkElement, GridLength, GridUnitType,
+    HorizontalAlignment, LaunchActivatedEventArgs, ResourceDictionary, RoutedEventHandler,
+    Thickness, UIElement, VerticalAlignment,
 };
 use winui3::{XamlApp, XamlAppOverrides};
 
@@ -135,6 +136,8 @@ struct Flyout {
     _src: DesktopWindowXamlSource,
     hwnd: HWND,
     items: Items,
+    /// 显式设了主题画刷的元素集合，主题切换时重刷（见 apply_theme_brushes）。
+    themed: Themed,
     visible: bool,
     /// 上次收起的时刻，用于识别「点托盘收起」这一手势，见 `toggle_at`。
     hidden_at: Option<std::time::Instant>,
@@ -438,40 +441,101 @@ unsafe extern "system" fn enum_child_layout(child: HWND, lparam: LPARAM) -> BOOL
     BOOL(1)
 }
 
-/// 从 Application 资源字典取主题画刷并应用。
+/// 显式设了主题画刷的元素集合，供主题切换时重刷（见 apply_theme_brushes）。
+struct Themed {
+    /// 三张设置卡片：底色 + 描边。
+    cards: Vec<Border>,
+    /// 内容区底板：LayerOnAcrylic 底色 + 底边分隔线描边（归属说明见 make_content）。
+    content: Border,
+    /// 主题画刷的来源字典：挂进 Application 的那份 XamlControlsResources。
+    /// 激活失败时为 None，set_brush 回退到顶层 Lookup。
+    dict: Option<ResourceDictionary>,
+}
+
+/// 按当前实际主题取主题画刷并应用。
 ///
-/// 这些键在亮/暗主题下自动解析成不同的值，配色随系统主题切换，无需自维护调色板。
-/// 查不到时静默跳过、不算失败：控件退化为无背景/无描边仍可用，
-/// 为一个配色让整个面板建不起来不划算。
-fn set_brush<F>(key: &str, apply: F) -> Result<()>
+/// 优先在 XamlControlsResources 的 ThemeDictionaries 里按 `theme` 精确取
+/// （"Dark"/"Light" 字典）：直接对顶层资源字典 Lookup 会走 "Default" 主题字典，
+/// 拿到的是解析那一刻的固化值，不随主题切换。取不到（旧运行时键缺失、
+/// XCR 未挂上）时回退顶层 Lookup；仍查不到时静默跳过、不算失败——
+/// 控件退化为无背景/无描边仍可用，为一个配色让整个面板建不起来不划算。
+fn set_brush<F>(
+    dict: Option<&ResourceDictionary>,
+    theme: ElementTheme,
+    key: &str,
+    apply: F,
+) -> Result<()>
 where
     F: FnOnce(&Brush) -> Result<()>,
 {
     let boxed = PropertyValue::CreateString(&HSTRING::from(key))?;
-    if let Ok(b) = Application::Current()
-        .and_then(|a| a.Resources())
-        .and_then(|r| r.Lookup(&boxed))
-        .and_then(|v| v.cast::<Brush>())
-    {
+    let brush = (|| -> Result<Brush> {
+        if let Some(d) = dict {
+            let which = if theme == ElementTheme::Dark {
+                "Dark"
+            } else {
+                "Light"
+            };
+            let k = PropertyValue::CreateString(&HSTRING::from(which))?;
+            if let Ok(td) = d
+                .ThemeDictionaries()
+                .and_then(|m| m.Lookup(&k))
+                .and_then(|v| v.cast::<ResourceDictionary>())
+            {
+                if let Ok(b) = td.Lookup(&boxed).and_then(|v| v.cast::<Brush>()) {
+                    return Ok(b);
+                }
+            }
+        }
+        Application::Current()?
+            .Resources()?
+            .Lookup(&boxed)?
+            .cast::<Brush>()
+    })();
+    if let Ok(b) = brush {
         apply(&b)?;
     }
     Ok(())
 }
 
-/// Win11 设置页那种卡片：圆角 + 描边 + 主题背景。
+/// 显式画刷的统一应用点：卡片与内容区的底色/描边。
 ///
-/// 三个键都来自 WinUI 主题资源，与「系统 › 屏幕」里的卡片同源：
+/// 两个卡片键都来自 WinUI 主题资源，与「系统 › 屏幕」里的卡片同源：
 ///  * `CardBackgroundFillColorDefaultBrush` —— 卡片底色
 ///  * `CardStrokeColorDefaultBrush` —— 1px 描边
-///  * 圆角 8 —— 对应 `OverlayCornerRadius` 档位。设置页里的卡片、快速设置面板里的
-///    分组块用的都是这一档；`ControlCornerRadius`（4）是按钮/输入框那种控件级圆角，
-///    用在卡片上会明显偏小。
+///
+/// 必须集中在这一处、且能被反复调用：控件模板里的 ThemeResource 在系统主题
+/// 切换时会自动重解析，而代码里 SetBackground 上去的画刷不会——它固化着
+/// 取出那一刻的主题色，曾导致运行期间切换亮/暗后「模板部分（文字/开关）
+/// 已跟随、卡片与内容区仍是旧主题色」的混搭。构建时应用一次，之后由 root 的
+/// `ActualThemeChanged` 事件回调按新主题重刷（见 build）。
+fn apply_theme_brushes(t: &Themed, theme: ElementTheme) {
+    let dict = t.dict.as_ref();
+    for card in &t.cards {
+        let _ = set_brush(dict, theme, "CardBackgroundFillColorDefaultBrush", |b| {
+            card.SetBackground(b)
+        });
+        let _ = set_brush(dict, theme, "CardStrokeColorDefaultBrush", |b| {
+            card.SetBorderBrush(b)
+        });
+    }
+    let _ = set_brush(dict, theme, "LayerOnAcrylicFillColorDefaultBrush", |b| {
+        t.content.SetBackground(b)
+    });
+    let _ = set_brush(dict, theme, "CardStrokeColorDefaultBrush", |b| {
+        t.content.SetBorderBrush(b)
+    });
+}
+
+/// Win11 设置页那种卡片：圆角 + 描边 + 主题背景。
+///
+/// 这里只负责几何（圆角/描边宽度/内边距）；底色与描边画刷由
+/// `apply_theme_brushes` 统一应用并随主题重刷，画刷键的说明见该函数。
+/// 圆角 8 对应 `OverlayCornerRadius` 档位：设置页里的卡片、快速设置面板里的
+/// 分组块用的都是这一档；`ControlCornerRadius`（4）是按钮/输入框那种控件级圆角，
+/// 用在卡片上会明显偏小。
 fn make_card() -> Result<Border> {
     let card = Border::new()?;
-    set_brush("CardBackgroundFillColorDefaultBrush", |b| {
-        card.SetBackground(b)
-    })?;
-    set_brush("CardStrokeColorDefaultBrush", |b| card.SetBorderBrush(b))?;
     card.SetBorderThickness(Thickness {
         Left: 1.0,
         Top: 1.0,
@@ -647,7 +711,8 @@ fn make_command_button(glyph: &str, label: &str) -> Result<AppBarButton> {
 /// 视觉上是「上亮下透」。浮窗坐在亚克力上，故换成 `LayerOnAcrylic` 那一支。
 ///
 /// 分隔线同样归内容区：模板里 `BorderThickness="0,0,0,1"` 挂在内容区**底边**。
-fn make_content(items: &Items) -> Result<Border> {
+/// `cards` 收集显式设主题画刷的卡片，供 apply_theme_brushes 重刷。
+fn make_content(items: &Items, cards: &mut Vec<Border>) -> Result<Border> {
     let panel = StackPanel::new()?;
     panel.SetSpacing(f64::from(CARD_GAP))?;
 
@@ -663,19 +728,17 @@ fn make_content(items: &Items) -> Result<Border> {
     })?;
     panel.Children()?.Append(&title)?;
 
-    panel.Children()?.Append(&make_night_card(items)?)?;
-    panel
-        .Children()?
-        .Append(&make_switch_card("深色模式", &items.dark)?)?;
-    panel
-        .Children()?
-        .Append(&make_switch_card("开机自启", &items.autostart)?)?;
+    let night_card = make_night_card(items)?;
+    panel.Children()?.Append(&night_card)?;
+    cards.push(night_card);
+    let dark_card = make_switch_card("深色模式", &items.dark)?;
+    panel.Children()?.Append(&dark_card)?;
+    cards.push(dark_card);
+    let auto_card = make_switch_card("开机自启", &items.autostart)?;
+    panel.Children()?.Append(&auto_card)?;
+    cards.push(auto_card);
 
     let content = Border::new()?;
-    set_brush("LayerOnAcrylicFillColorDefaultBrush", |b| {
-        content.SetBackground(b)
-    })?;
-    set_brush("CardStrokeColorDefaultBrush", |b| content.SetBorderBrush(b))?;
     content.SetBorderThickness(Thickness {
         Left: 0.0,
         Top: 0.0,
@@ -737,12 +800,17 @@ fn build() -> Result<Flyout> {
     let root = StackPanel::new()?;
 
     // 必须在任何 make_card / set_brush 之前：控件模板与主题画刷都在这份字典里。
-    // 合并到 Application 级而非 root，set_brush 走的正是 Application::Current().Resources()。
+    // 合并到 Application 级而非 root；画刷另从这份字典的 ThemeDictionaries 按
+    // 实际主题精确取（见 set_brush），故保留字典本身一份引用。
     // 前提是 XamlApp::compose 已在 WindowsXamlManager 之前建立带元数据 provider
     // 的 Application，否则此处激活失败返回 E_FAIL。
-    if let (Ok(res), Ok(app)) = (XamlControlsResources::new(), Application::Current()) {
-        app.Resources()?.MergedDictionaries()?.Append(&res)?;
-    }
+    let dict = match (XamlControlsResources::new(), Application::Current()) {
+        (Ok(res), Ok(app)) => {
+            app.Resources()?.MergedDictionaries()?.Append(&res)?;
+            Some(res.cast::<ResourceDictionary>()?)
+        }
+        _ => None,
+    };
 
     // 各控件的状态先留默认，与值一并在 SetContent 之后由 sync 落实（原因见 Items::sync）。
     let strength = Slider::new()?;
@@ -760,10 +828,35 @@ fn build() -> Result<Flyout> {
     };
     bind_controls(&items)?;
 
-    root.Children()?.Append(&make_content(&items)?)?;
+    let mut cards = Vec::new();
+    let content = make_content(&items, &mut cards)?;
+    let themed = Themed {
+        cards,
+        content: content.clone(),
+        dict,
+    };
+    root.Children()?.Append(&content)?;
     root.Children()?.Append(&make_footer()?)?;
 
     src.SetContent(&root)?;
+
+    // 显式画刷按当前实际主题应用一次；此后由 ActualThemeChanged 跟随系统主题
+    // 切换重刷（固化的画刷曾导致运行期间切换亮/暗后卡片/内容区停在旧主题色，
+    // 见 apply_theme_brushes）。
+    let root_fe = root.cast::<FrameworkElement>()?;
+    apply_theme_brushes(&themed, root_fe.ActualTheme().unwrap_or(ElementTheme::Light));
+    root_fe.ActualThemeChanged(&TypedEventHandler::new(
+        |fe: Ref<'_, FrameworkElement>, _: Ref<'_, IInspectable>| {
+            if let Ok(theme) = fe.ok().and_then(|e| e.ActualTheme()) {
+                FLYOUT.with(|c| {
+                    if let Some(f) = c.borrow().as_ref() {
+                        apply_theme_brushes(&f.themed, theme);
+                    }
+                });
+            }
+            Ok(())
+        },
+    ))?;
 
     // 初值必须等到内容树挂上宿主、模板套用之后再写，详见 Items::sync。
     items.sync();
@@ -801,6 +894,7 @@ fn build() -> Result<Flyout> {
         _src: src,
         hwnd,
         items,
+        themed,
         visible: false,
         hidden_at: None,
     })
