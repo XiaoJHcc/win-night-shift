@@ -929,7 +929,10 @@ fn bind_controls(items: &Items) -> Result<()> {
             if due {
                 LAST_WRITE.with(|c| c.set(now));
                 PENDING_STRENGTH.with(|c| c.set(None));
-                crate::nightlight::set_strength(p);
+                // 写入被拒（结构校验/回读不符）时扳回滑条，不静默失效。
+                if !crate::nightlight::set_strength(p) {
+                    refresh();
+                }
             } else {
                 PENDING_STRENGTH.with(|c| c.set(Some(p)));
             }
@@ -939,7 +942,9 @@ fn bind_controls(items: &Items) -> Result<()> {
     items.strength.PointerCaptureLost(&PointerEventHandler::new(|_, _| {
         if let Some(p) = PENDING_STRENGTH.with(|c| c.take()) {
             LAST_WRITE.with(|c| c.set(Instant::now()));
-            crate::nightlight::set_strength(p);
+            if !crate::nightlight::set_strength(p) {
+                refresh();
+            }
         }
         Ok(())
     }))?;
