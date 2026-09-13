@@ -32,12 +32,77 @@ fn main() {
             nightlight::set_strength_perdevice_fixts(v)
         );
     }
+    if args.iter().any(|a| a == "--poke") {
+        println!("poke_state() -> {}", nightlight::poke_state());
+    }
+    // dump --cycle <ms>：实验用。夜间模式开关翻转一次再翻回（间隔 ms），
+    // 测试「状态跳变触发系统重新应用 settings」的最小间隔与闪屏观感。
+    if let Some(pos) = args.iter().position(|a| a == "--cycle") {
+        let ms: u64 = args.get(pos + 1).and_then(|s| s.parse().ok()).unwrap_or(300);
+        let was_on = nightlight::get_enabled().unwrap_or(false);
+        println!("enabled before: {was_on}");
+        println!("flip away -> {}", nightlight::set_enabled(!was_on));
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        println!("flip back -> {}", nightlight::set_enabled(was_on));
+    }
+    // dump --poke-struct <ms>：实验用。state blob 保持字节 18=0x15（开）不变，
+    // 先删除 23/24 的 10 00 结构标记、间隔 ms 后再插回（两个 blob 都是系统
+    //  canonical 形态），测试「结构变化但逻辑状态不变」是否触发重新应用。
+    if let Some(pos) = args.iter().position(|a| a == "--poke-struct") {
+        let ms: u64 = args.get(pos + 1).and_then(|s| s.parse().ok()).unwrap_or(50);
+        println!("poke_struct({ms}) -> {}", poke_struct(ms));
+    }
+    if args.iter().any(|a| a == "--fresh") {
+        println!("make_fresh() -> {}", make_fresh());
+    }
     if args.iter().any(|a| a == "--keys") {
         dump_keys();
     }
     println!("night light enabled: {:?}", nightlight::get_enabled());
     println!("night light strength: {:?}", nightlight::get_strength());
     println!("dark mode: {}", theme::is_dark());
+}
+
+/// 实验用（dump --poke-struct）：state blob 保持字节 18=0x15（开）不变，
+/// 先删除 23/24 的 `10 00` 结构标记、间隔 ms 后再插回。两个中间 blob 都是
+/// 系统自己会产生的 canonical 形态（开=43 字节有标记 / 关=41 字节无标记），
+/// 不制造未知布局。用于测试系统的重新应用触发器认不认「结构差分」。
+fn poke_struct(ms: u64) -> bool {
+    const KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default$windows.data.bluelightreduction.bluelightreductionstate\windows.data.bluelightreduction.bluelightreductionstate";
+    let Some(data) = reg::read_binary(KEY, "Data") else {
+        return false;
+    };
+    if data.len() != 43 || data[18] != 0x15 || data[23] != 0x10 || data[24] != 0x00 {
+        println!("unexpected state blob shape, abort: {:02X?}", data);
+        return false;
+    }
+    let mut stripped = data.clone();
+    stripped.splice(23..25, []);
+    if !reg::write_binary(KEY, "Data", &stripped) {
+        return false;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+    reg::write_binary(KEY, "Data", &data)
+}
+
+/// 实验用（dump --fresh）：把主设置键 blob 回退成「系统重建后的新鲜形态」——
+/// 移除 CF 28 色温字段、字节 18 改回 0x15。用于复现「夜间模式已开启 +
+/// 新鲜 blob 时，拖强度拉条实时不生效」的场景。
+fn make_fresh() -> bool {
+    const KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default$windows.data.bluelightreduction.settings\windows.data.bluelightreduction.settings";
+    let Some(mut data) = reg::read_binary(KEY, "Data") else {
+        println!("read failed");
+        return false;
+    };
+    let Some(i) = data.windows(2).position(|w| w == [0xCF, 0x28]) else {
+        println!("no CF 28, already fresh?");
+        return false;
+    };
+    println!("before (len={}): {:02X?}", data.len(), data);
+    data.splice(i..i + 4, []);
+    data[18] = 0x15;
+    println!("after  (len={}): {:02X?}", data.len(), data);
+    reg::write_binary(KEY, "Data", &data)
 }
 
 /// 列出 CloudStore 下所有夜间模式相关键：解析出的色温/强度、blob 时间戳字节、
