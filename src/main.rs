@@ -7,6 +7,7 @@
 mod autostart;
 mod flyout;
 mod nightlight;
+mod preview;
 mod reg;
 mod theme;
 mod tray;
@@ -50,6 +51,9 @@ fn main() {
     if !flyout::init() {
         return;
     }
+
+    // 色温预览（mscms 系统通道）：通道缺失不致命，内部降级。
+    preview::init();
 
     // 托盘必须在消息循环所在线程创建。
     let Some(tray) = tray::Tray::new() else {
@@ -103,6 +107,11 @@ fn main() {
             tray.refresh_icon();
         }
     }
+
+    // 退出前收尾：预览还生效着就把硬件色温恢复系统应有值（拖动中退出的
+    // 交接）；已松手时预览值==注册表值，对比相等不动硬件——mscms 通道的
+    // 粘性残留即正确状态。
+    preview::shutdown();
 }
 
 /// 创建一个 message-only 隐藏窗口，用于接收 WM_TIMER。

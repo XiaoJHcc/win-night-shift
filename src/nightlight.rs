@@ -1,7 +1,11 @@
 //! Windows 夜间模式（Night Light）控制。
 //!
 //! 没有公开 API，使用未文档化的 CloudStore 注册表 blob（社区逆向，Win10 2004+
-//! 与 Win11 通用，写入后立即生效）：
+//! 与 Win11 通用）。**注意「写入即生效」不再成立**（2026-09，Win11 25H2 逐条
+//! 对照实验确认）：外部对主设置键的写入只落盘、屏幕不跟随；state 键同值
+//! 重写、结构 poke 均不触发重新应用，唯一的外部触发是 state 键的**状态跳变**
+//! （`reapply` 利用这一点做预览不可用时的松手降级）。拖动期间的实时预览走
+//! `preview` 模块的 mscms 系统通道，与本模块无关。
 //!
 //! - 开关：`...\bluelightreductionstate` 键的 `Data`。
 //!   `data[18] == 0x15` 为开、`0x13` 为关；翻转时推进内嵌时间戳（策略见
@@ -221,11 +225,14 @@ fn classify_settings_parent(name: &str) -> Option<bool> {
 /// 设置强度 0–100：**只写主设置键**（与系统设置 App 的写入面一致），
 /// 并推进 blob 内嵌时间戳，让系统的 CloudStore 监听接受这次修改。
 ///
+/// 调用方注意：此函数只负责**落盘**。25H2 上系统不会因这次写入实时应用
+/// （见模块头注释），屏幕跟随由调用方负责——preview 的 mscms 系统通道
+/// （拖动预览，粘性设定、松手后天然一致）或 `reapply` 的开关循环
+/// （预览不可用时降级）。
 /// per-device 键不写：它是系统维护的派生副本，外部写入对显示效果为零
 /// （FF 时间戳的写入被系统无视；有效时间戳的单次写入也不生效）；
 /// 早期版本高频同时写主键+per-device 曾被系统判定冲突打回夜间模式，
 /// 既然写了没用，就远离出事条件。详见模块头注释。
-/// 只写主键已实测能让屏幕色温即时生效且长期不被系统改动。
 /// 一把都找不到（用户从未碰过夜间模式设置）时按模板重建主设置键。
 pub fn set_strength(strength: u32) -> bool {
     let kelvin = strength_to_kelvin(strength);
@@ -241,6 +248,46 @@ pub fn set_strength(strength: u32) -> bool {
         any = write_kelvin_to(&k, kelvin) || any;
     }
     any
+}
+
+/// 诊断（examples/dump --poke）：不改变开关状态，只推进 state blob 的
+/// 内嵌时间戳并重写。用于测试「state 键的一次写入是否触发系统重新解析
+/// settings blob 并实时应用」——排查「插入 CF 28 后实时路径不认」的对照实验。
+/// 2026-09 Win11 25H2 实测结论：不触发（见 reapply）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn poke_state() -> bool {
+    let Some(mut data) = reg::read_binary(STATE_KEY, "Data") else {
+        return false;
+    };
+    if data.len() < 25 {
+        return false;
+    }
+    bump_timestamp(&mut data);
+    reg::write_binary(STATE_KEY, "Data", &data)
+}
+
+/// 强制系统立即重新应用 settings blob：开/关状态快速翻转一次。
+///
+/// 背景（2026-09 Win11 25H2 实测，逐条对照实验确认）：
+/// 外部对主设置键的写入**只落盘、屏幕不跟随**——系统不再因 settings 键的
+/// 注册表变更而实时应用（更早的实测里曾可以，行为已随系统版本变化）；
+/// state 键的同值重写（只推进时间戳）也不触发；唯一可靠的外部触发是
+/// state 键的**状态跳变**。因此拉条松手写完最终值后调用本函数，
+/// 让新色温立即生效，而不是等用户手动开关一次。
+///
+/// 间隔取 100ms：30/100/400ms 实测都能触发，取中间值给系统繁忙留余量。
+/// 间隔内屏幕会短暂回到正常色温（闪一下），是该机制无法避免的代价。
+/// 夜间模式关着时没有需要实时应用的东西，直接返回（下次开启时系统自会
+/// 应用落盘的强度）。翻转失败返回 false，调用方应 refresh 把控件扳回真实状态。
+pub fn reapply() -> bool {
+    if get_enabled() != Some(true) {
+        return true;
+    }
+    if !set_enabled(false) {
+        return false;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    set_enabled(true)
 }
 
 /// 只写 per-device 键（诊断/对照实验用，examples/dump --set-perdevice）。

@@ -16,7 +16,6 @@
 //!    返回 `E_POINTER`。
 
 use std::cell::{Cell, RefCell};
-use std::time::{Duration, Instant};
 use windows::core::{h, IInspectable, Interface, Ref, Result, BOOL, HSTRING};
 use windows::Foundation::{PropertyValue, TypedEventHandler};
 use windows::Graphics::{RectInt32, SizeInt32};
@@ -152,16 +151,9 @@ thread_local! {
     static FLYOUT: RefCell<Option<Flyout>> = const { RefCell::new(None) };
     /// 程序化写控件期间置位，控件事件回调据此跳过（防写回与双向同步回环）。
     static SYNCING: Cell<bool> = const { Cell::new(false) };
-    /// 强度滑条写注册表的节流状态：上次写入时刻与待补写的值。
-    static LAST_WRITE: Cell<Instant> = Cell::new(Instant::now());
-    static PENDING_STRENGTH: Cell<Option<u32>> = const { Cell::new(None) };
     /// 调试钉住：置位时失焦不收起（仅 debug 构建，见 init）。
     static PINNED: Cell<bool> = const { Cell::new(false) };
 }
-
-/// 强度写注册表的最小间隔（毫秒）。拖动期间的密集写入会被 CloudStore
-/// 判定为冲突（实测把夜间模式打回关闭），必须限速。
-const WRITE_THROTTLE: Duration = Duration::from_millis(300);
 
 fn is_syncing() -> bool {
     SYNCING.with(|c| c.get())
@@ -241,14 +233,25 @@ pub fn refresh() {
     });
 }
 
-/// 外部改动（watch 线程投来的注册表变更通知）：面板可见时现读系统状态回写控件。
+/// 外部改动（watch 线程投来的注册表变更通知）。
 ///
-/// 两个保护：
-///  * 面板隐藏时直接返回——下次打开时 show_at 会 sync，无需现在做；
+/// 预览（preview）的状态跟踪与面板可见性无关，必须无条件处理：外部变更
+/// 接管系统状态（引擎按注册表值重应用时会自然覆盖预览色温），预览跟踪
+/// 必须及时收敛。回声判定见 preview::is_echo——我们自己松手写入引发的通知
+/// 不是外部变更，预览必须保持。
+///
+/// 控件同步的两个保护：
+///  * 面板隐藏时不同步——下次打开时 show_at 会 sync，无需现在做；
 ///  * 滑条正被按住（PointerCaptures 非空）时不同步——此时注册表里可能还是
-///    节流前的旧值，回写会把滑条从用户手下拽走。松手后补写最终值引发的
-///    回声通知读到的就是当前值，sync 自然是无操作。
+///    旧值，回写会把滑条从用户手下拽走。松手后补写最终值引发的回声通知
+///    读到的就是当前值，sync 自然是无操作。
 pub fn on_external_change() {
+    let enabled = crate::nightlight::get_enabled().unwrap_or(false);
+    let strength = crate::nightlight::get_strength();
+    if !crate::preview::is_echo(enabled, strength) {
+        crate::preview::restore_system();
+        crate::preview::set_system_state(enabled, strength);
+    }
     FLYOUT.with(|c| {
         let borrow = c.borrow();
         let Some(f) = borrow.as_ref() else { return };
@@ -285,6 +288,8 @@ impl Flyout {
     fn show_at(&mut self, tray_rect: tray_icon::Rect) {
         // 定好位再显示，避免弹出瞬间先在上一次的旧位置闪一下。
         self.place(&tray_rect);
+        // 面板打开时重建预览的显示器 HDC 缓存（覆盖热插拔）。
+        crate::preview::refresh_monitors();
         // 每次打开都从系统现读状态刷新控件：开关可能被系统设置等外部途径改动。
         self.items.sync();
 
@@ -900,9 +905,18 @@ fn build() -> Result<Flyout> {
 /// 写入失败（返回 false）时 refresh 一遍，把控件扳回真实状态。
 fn bind_controls(items: &Items) -> Result<()> {
     bind_tile(&items.night, |v| {
+        // 先清预览跟踪再翻转：翻转后引擎按注册表值重应用，自然覆盖预览
+        // 色温，无需主动恢复（preview 通道是粘性的绝对设定）。
+        crate::preview::disengage();
         if !crate::nightlight::set_enabled(v) {
             refresh();
         }
+        // 状态跳变时系统必然重新应用了注册表值：校准 preview 的状态跟踪。
+        let on = crate::nightlight::get_enabled().unwrap_or(false);
+        crate::preview::set_system_state(
+            on,
+            on.then(|| crate::nightlight::get_strength()).flatten(),
+        );
     })?;
     bind_tile(&items.dark, |v| {
         if !crate::theme::set_dark(v) {
@@ -917,37 +931,44 @@ fn bind_controls(items: &Items) -> Result<()> {
                 return Ok(());
             }
             let p = args.ok()?.NewValue()?.round().clamp(0.0, 100.0) as u32;
-            // 色温值实时更新，但注册表写做节流：拖动会高频触发 ValueChanged，
-            // 对 CloudStore 的密集外部写入会被系统判定冲突（实测会把夜间模式
-            // 打回关闭）。两次写至少间隔 WRITE_THROTTLE，期间的值记入 PENDING，
-            // 松手（PointerCaptureLost）时补写最后一笔。
+            // 拖动期间不写注册表：25H2 上外部写入系统根本不实时应用（写了
+            // 也没用，还白添冲突风险）。实时反馈由 preview 的 mscms 系统通道
+            // 负责（与引擎同一条应用路径），注册表只在松手时落盘一次
+            // （见 PointerCaptureLost）。
             let _ = kelvin.SetText(&HSTRING::from(kelvin_text(p)));
-            let now = Instant::now();
-            let due = LAST_WRITE.with(|c| {
-                now.duration_since(c.get()).as_millis() >= WRITE_THROTTLE.as_millis()
-            });
-            if due {
-                LAST_WRITE.with(|c| c.set(now));
-                PENDING_STRENGTH.with(|c| c.set(None));
-                // 写入被拒（结构校验/回读不符）时扳回滑条，不静默失效。
-                if !crate::nightlight::set_strength(p) {
-                    refresh();
-                }
-            } else {
-                PENDING_STRENGTH.with(|c| c.set(Some(p)));
-            }
+            crate::preview::set_preview(p);
             Ok(())
         },
     ))?;
-    items.strength.PointerCaptureLost(&PointerEventHandler::new(|_, _| {
-        if let Some(p) = PENDING_STRENGTH.with(|c| c.take()) {
-            LAST_WRITE.with(|c| c.set(Instant::now()));
-            if !crate::nightlight::set_strength(p) {
+
+    let strength_slider = items.strength.clone();
+    items
+        .strength
+        .PointerCaptureLost(&PointerEventHandler::new(move |_, _| {
+            let p = strength_slider
+                .Value()
+                .map(|v| v.round().clamp(0.0, 100.0) as u32)
+                .unwrap_or(50);
+            // 值没变（原地点击等）就不写：少一次无谓的注册表写与时间戳推进。
+            if crate::nightlight::get_strength() == Some(p) {
+                return Ok(());
+            }
+            let enabled = crate::nightlight::get_enabled().unwrap_or(false);
+            if crate::nightlight::set_strength(p) {
+                crate::preview::record_written(p);
+                // 预览没生效（mscms 通道不可用等）且夜间模式开着、值变了：
+                // 降级为一次开关循环，让落盘值立即被系统应用（闪一下）。
+                if !crate::preview::engaged() && enabled && crate::preview::applied() != Some(p) {
+                    crate::nightlight::reapply();
+                }
+            } else {
+                // 写入被拒（结构校验/回读不符）：把屏幕与滑条都扳回真实
+                // 状态，不静默失效。
+                crate::preview::restore_system();
                 refresh();
             }
-        }
-        Ok(())
-    }))?;
+            Ok(())
+        }))?;
     Ok(())
 }
 

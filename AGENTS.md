@@ -25,7 +25,8 @@ cargo run --example dump     # 诊断：dump CloudStore 夜间模式键
 | `src/main.rs` | 入口、DPI 感知（Per-Monitor-V2）、隐藏消息窗口、消息循环、托盘事件分发、`TRAY_ICON_DIRTY` |
 | `src/flyout.rs` | WinUI 3 托盘浮窗（XAML 岛、托盘锚定定位、卡片样式、失焦收起） |
 | `src/tray.rs` | 托盘图标与右键菜单（muda：开机自启勾选/设置/退出）；图标按任务栏主题选白/黑 |
-| `src/nightlight.rs` | 夜间模式 CloudStore 注册表 blob 读写（开关 + 强度） |
+| `src/nightlight.rs` | 夜间模式 CloudStore 注册表 blob 读写（开关 + 强度落盘）、`reapply` 开关循环交接 |
+| `src/preview.rs` | 拖动拉条的实时色温预览（mscms `InternalSetDeviceTemperature` 系统通道）、系统状态跟踪、崩溃残留兜底、退出交接 |
 | `src/theme.rs` | Personalize 键亮暗切换 + `ImmersiveColorSet` 广播 |
 | `src/autostart.rs` | HKCU\...\Run 开机自启 |
 | `src/watch.rs` | 注册表变更监听线程（CloudStore / Personalize），命中后投 `WM_SETTINGS_CHANGED` 给隐藏窗口 |
@@ -59,11 +60,22 @@ cargo run --example dump     # 诊断：dump CloudStore 夜间模式键
 ## 夜间模式（CloudStore）读写策略
 
 夜间模式没有公开 API，使用未文档化的 CloudStore 注册表 blob（社区逆向，
-Win10 2004+ / Win11 通用，写入立即生效）。blob 操作均带格式校验，
-格式不符时静默失败不 panic。实测确认的策略（Win11）：
+Win10 2004+ / Win11 通用）。blob 操作均带格式校验，格式不符时静默失败
+不 panic。实测确认的策略（Win11）：
 
+- **「写入即生效」在 25H2 上不再成立**（2026-09，逐条对照实验确认）：
+  外部写主设置键只落盘、屏幕**永不**实时跟随（无论 blob 形态、字节 18
+  是 0x15 还是 0x19）；state 键同值重写（只推进时间戳）不触发；state 键
+  结构 poke（保持字节 18=0x15，删除再插回 23/24 的 `10 00`）也不触发。
+  **唯一可靠的外部触发是 state 键的状态跳变**（关↔开），30/100/400ms 间隔
+  都有效，代价是闪一下正常色温。因此：
+  - 拖动拉条的实时反馈**不走注册表**，走 `preview` 模块的 mscms 系统通道
+    （见下节）；注册表只在松手时落盘一次；
+  - 预览不可用（mscms 通道缺失）时降级为松手后一次开关循环
+    （`nightlight::reapply`）。mscms 通道效果粘性：松手后屏幕与落盘值
+    天然一致，退出无需交接闪屏；拖动中退出时把硬件恢复系统应有值即可。
 - **写入只写主设置键**（`default$...bluelightreduction.settings`），与系统
-  设置 App 的写入面一致：只写主键即可让屏幕色温即时生效且长期保持。
+  设置 App 的写入面一致。
   per-device 键是系统维护的派生副本（系统落盘时会把主键值同步过去），
   外部写它对显示没有效果，本工具不写它——早期版本高频同时写主键+per-device
   曾被系统判定冲突、把夜间模式打回关闭。
@@ -97,18 +109,57 @@ Win10 2004+ / Win11 通用，写入立即生效）。blob 操作均带格式校�
   （通常是关闭设置页后）实时跟随，而不是拖动的当下——这是系统行为，不是
   面板漏更新。
 
+## 色温预览（preview 模块，mscms 系统通道）
+
+25H2 上注册表写入不触发实时应用（见上节），拖动拉条的实时反馈走
+**夜间模式引擎自己的应用通道**（2026-09 逆向确认 + 实测定性，完整过程见
+`RESEARCH-nightlight-api.md`）：本机引擎（explorer 内
+`Windows.Shell.BlueLightReduction.dll`）在 `ShouldUseDESPath`=false 时调用
+`mscms.dll` 的延迟加载导出 **ordinal 204 = `InternalSetDeviceTemperature`**，
+签名 `(HDC, float kelvin, u32=0, u32=0) -> BOOL`，HDC 按屏
+`CreateDCW("DISPLAY", \\.\DISPLAYn, ...)` 创建。与系统夜灯同一条路径：
+色彩完全一致、截屏行为同系统夜灯。（引擎另一条 DES 路径
+`StartNightLightTransition(float kelvin, double durationMs, enum)` 语义已逆向
+确认，但本机色彩映射错误——过饱和黄，不可用。）
+
+- 效果是**粘性的绝对设定**：DeleteDC、进程退出均不回弹，保持到下一次有
+  人设色温。因此拖动=直接设目标色温，松手落盘后屏幕与注册表天然一致，
+  零闪烁零交接——Mag 矩阵时代的「松手 disengage + 开关循环」收尾不再需要；
+- 夜灯开关切换、设置 App 拖条时引擎按注册表值重应用，**自然覆盖预览**
+  ——`disengage` 只清跟踪、不动硬件；需要主动收敛的时刻（松手写失败扳回、
+  外部非回声变更、拖动中退出）调 `restore_system`，把硬件设回系统应有值
+  （夜灯开取注册表 kelvin，关取 6500，读不出强度则不猜、不动硬件）；
+- **崩溃/被杀会残留预览色温**（粘性，无法自动回收）：首次进入预览时写
+  `HKCU\Software\win-night-shift` 的 `PreviewEngaged`=1，正常收尾删除；
+  下次启动 init 发现残留标志即按系统应有值恢复一次。兜底失效也无碍——
+  任何一次引擎重应用（夜灯开关切换等）都会覆盖残留；
+- 「系统已应用强度」（APPLIED）仍只能跟踪：启动/开关切换/外部变更时按
+  注册表值校准，供 mscms 缺失时的 `reapply` 降级判断；回声判定
+  （`preview::is_echo`）保留——松手落盘引发的 watch 通知不是外部变更，
+  预览跟踪不能误清；
+- HDC 缓存按屏持有：init 与每次面板打开（`Flyout::show_at` →
+  `refresh_monitors`）时重建，set 调用失败时重建重试一次；DeleteDC 不影响
+  已设的粘性色温，预览中途重建安全；
+- 降级：mscms/ordinal 204 缺失（非夜灯机型）时 `set_preview` 静默不做事，
+  松手走 `nightlight::reapply` 开关循环（闪一下，与旧版 Magnification
+  缺失时相同）。Mag 矩阵方案（DWM 相对矩阵）因冷拉偏色 + 截屏污染已整体
+  退役删除。
+
 ## 外部变更监听与面板同步
 
 watch 线程用 `RegNotifyChangeKeyValue` 监听 CloudStore（夜间模式）与
 Personalize（亮暗）两处键，落盘时投 `WM_SETTINGS_CHANGED` 给隐藏消息窗口，
-主线程据此同步面板控件并刷新托盘图标（见上文图标管线）。`RegNotifyChangeKeyValue`
-是一次性的，每次触发后重新挂。面板每次打开也会现读一次系统状态；拖动拉条
-期间不回写，避免把滑条从用户手下拽走。
+主线程据此同步面板控件、刷新托盘图标（见上文图标管线）并校准 preview
+状态跟踪（见上节）。`RegNotifyChangeKeyValue` 是一次性的，每次触发后重新挂。
+面板每次打开也会现读一次系统状态；拖动拉条期间不回写控件，避免把滑条
+从用户手下拽走。
 
 ## 其他约定
 
-- 强度拉条拖动时注册表写入做 300ms 节流（密集写入会被系统判定冲突），
-  松手时补写最终值。
+- 强度拉条**拖动期间不写注册表**（25H2 上系统不实时应用，写了只会白添
+  冲突风险），实时反馈由 preview 的 mscms 系统通道负责；松手时落盘一次
+  最终值。mscms 通道不可用时降级：松手后一次开关循环
+  （`nightlight::reapply`，闪一下）让落盘值生效。
 - winui3 crate 从 git 拉取（crates.io 的 0.4.5 缺 `UI_Xaml_Hosting` 等
   feature），首次构建较慢。
 - UI 依赖系统已装的 WindowsAppRuntime（WinUI 3 运行时），运行时缺失时
