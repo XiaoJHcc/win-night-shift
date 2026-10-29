@@ -18,7 +18,7 @@
 use std::cell::{Cell, RefCell};
 use windows::core::{h, IInspectable, Interface, Ref, Result, BOOL, HSTRING};
 use windows::Foundation::{PropertyValue, TypedEventHandler};
-use windows::Graphics::{RectInt32, SizeInt32};
+use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_DEFAULT, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -286,17 +286,26 @@ impl Flyout {
 
     /// 依托盘图标位置定位并显示。坐标全程用物理像素，与 `tray_rect` 一致。
     fn show_at(&mut self, tray_rect: tray_icon::Rect) {
-        // 定好位再显示，避免弹出瞬间先在上一次的旧位置闪一下。
-        self.place(&tray_rect);
         // 面板打开时重建预览的显示器 HDC 缓存（覆盖热插拔）。
         crate::preview::refresh_monitors();
         // 每次打开都从系统现读状态刷新控件：开关可能被系统设置等外部途径改动。
         self.items.sync();
 
+        // 先按当前 DPI 摆一次，让窗口在显示前就落到托盘上方，避免弹出瞬间
+        // 在上一次的旧位置闪一下。分辨率/缩放刚变过时这里读到的 DPI 还是旧值，
+        // 尺寸只是占位，最终布局见 Show 之后的重算。
+        self.place(&tray_rect);
+
         if self.win.ShowWithActivation(true).is_err() {
             return;
         }
         self.visible = true;
+
+        // WinUI 在重新显示时才同步新的 DPI：分辨率或缩放变过之后，显示前
+        // `GetDpiForWindow` 仍返回旧值，按旧比例定下的窗口尺寸与 XAML 内容
+        // 的实际缩放对不上（内容被裁或留白），要到第二次打开才正常。
+        // 因此最终布局必须在 Show 之后按新 DPI 重算，这一次才真正落地。
+        self.place(&tray_rect);
 
         // ShowWithActivation 抢不过任务栏的前台锁定：托盘点击后前台仍是
         // explorer，面板始终非激活，失焦判定会立刻把它收起。必须显式夺取。
@@ -307,8 +316,10 @@ impl Flyout {
 
     /// 把窗口放到托盘图标上方：宽不变，右缘对齐托盘图标，底边贴在图标上方。
     ///
-    /// 位置与尺寸用一次 `MoveAndResize` 原子完成——拆成 ResizeClient + Move 两步时，
-    /// DWM 可能在两步之间合成出「尺寸已变、位置未变」的中间帧。
+    /// 位置与尺寸用一次 `SetWindowPos` 原子完成——拆成 ResizeClient + Move 两步时，
+    /// DWM 可能在两步之间合成出「尺寸已变、位置未变」的中间帧。用同步的 Win32
+    /// 调用而非 `AppWindow::MoveAndResize`：显示之后的这次重排必须在本帧合成前
+    /// 落地，后者的落地经过 WinUI 窗口框架，会先闪一帧错误尺寸。
     fn place(&self, tray_rect: &tray_icon::Rect) {
         let dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(96) as i32;
         let s = |v: i32| v * dpi / 96;
@@ -324,13 +335,10 @@ impl Flyout {
             y = y.clamp(wa.top, (wa.bottom - ph).max(wa.top));
         }
         // 本窗口无标题栏/边框（BorderAndTitleBar 已关），外框即客户区，
-        // MoveAndResize 的尺寸语义差异在此不成立。
-        let _ = self.win.MoveAndResize(RectInt32 {
-            X: x,
-            Y: y,
-            Width: pw,
-            Height: ph,
-        });
+        // SetWindowPos 的尺寸语义差异在此不成立。
+        unsafe {
+            let _ = SetWindowPos(self.hwnd, None, x, y, pw, ph, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         // 跨 DPI 显示器移动时尺寸会变，岛子窗口不自动跟随，需手动铺满。
         unsafe { position_island(self.hwnd) }
     }
